@@ -12,22 +12,24 @@
 """
 test_animate.py
 
-Generates FLUX images (via OpenRouter) for the first ~50s of a transcript,
+Generates images (via Gemini flash on OpenRouter) for the first ~20s of a transcript,
 then produces two test videos to compare animation styles:
 
-  output/test_kburns.mp4  -- Ken Burns slow zoom/pan (free)
-  output/test_aivid.mp4   -- RunwayML AI video animation (~$0.25/scene)
+  output/phase1_test/kburns.mp4  -- Ken Burns slow zoom/pan (free)
+  output/phase1_test/aivid.mp4   -- RunwayML AI video animation (~$0.25/scene)
 
 Usage:
   uv run test_animate.py                         # both styles
   uv run test_animate.py --style kburns          # Ken Burns only
   uv run test_animate.py --style aivid           # AI video only
-  uv run test_animate.py --seconds 60            # custom clip length
+  uv run test_animate.py --seconds 30            # custom clip length
   uv run test_animate.py --source video/my.mp4   # custom source MP4
+  uv run test_animate.py --dry-run               # preview scene plan, no cost
 """
 
 import argparse
 import base64
+import io
 import json
 import os
 import re
@@ -49,20 +51,34 @@ console = Console()
 # ---------------------------------------------------------------------------
 
 ROOT        = Path(__file__).parent
-OUTPUT_DIR  = ROOT / "output"
-IMAGES_DIR  = OUTPUT_DIR / "test_images"
-CLIPS_DIR   = OUTPUT_DIR / "test_aivid_clips"
-OUT_KBURNS  = OUTPUT_DIR / "test_kburns.mp4"
-OUT_AIVID   = OUTPUT_DIR / "test_aivid.mp4"
+OUTPUT_DIR  = ROOT / "output" / "phase1_test"
+IMAGES_DIR  = OUTPUT_DIR / "images"
+CLIPS_DIR   = OUTPUT_DIR / "aivid_clips"
+OUT_KBURNS  = OUTPUT_DIR / "kburns.mp4"
+OUT_AIVID   = OUTPUT_DIR / "aivid.mp4"
 
 OPENROUTER_BASE  = "https://openrouter.ai/api/v1"
 GEMINI_IMG_MODEL = "google/gemini-2.5-flash-image"
 DEEPSEEK_BASE    = "https://api.deepseek.com/v1"
-DEEPSEEK_MODEL = "deepseek-chat"
-RUNWAY_BASE   = "https://api.runwayml.com/v1"
-RUNWAY_VERSION = "2024-11-06"
+DEEPSEEK_MODEL   = "deepseek-chat"
+RUNWAY_BASE      = "https://api.runwayml.com/v1"
+RUNWAY_VERSION   = "2024-11-06"
 
 FPS = 24
+
+# ---------------------------------------------------------------------------
+# Prompt file loader
+# ---------------------------------------------------------------------------
+
+def _load_prompt(filename: str) -> str:
+    path = ROOT / "prompts" / filename
+    if not path.exists():
+        console.print(f"[red]ERROR:[/] Missing prompt file: {path}")
+        sys.exit(1)
+    return path.read_text(encoding="utf-8").strip()
+
+GROUP_SYSTEM  = _load_prompt("group_system.txt")
+PROMPT_SYSTEM = _load_prompt("prompt_system.txt")
 
 # ---------------------------------------------------------------------------
 # Environment
@@ -140,38 +156,12 @@ def find_transcript(source_mp4: Path) -> Path:
         if p.exists():
             return p
     console.print(f"[red]ERROR:[/] No transcript found for {source_mp4.name}")
+    console.print("Expected: same folder, same filename stem, .txt or .json extension.")
     sys.exit(1)
 
 # ---------------------------------------------------------------------------
-# Scene grouping with visual description (combined GROUP_SYSTEM)
+# Scene grouping
 # ---------------------------------------------------------------------------
-
-GROUP_SYSTEM = """You are an animation director for TheInnerWar, a psychology YouTube channel.
-
-Group the transcript segments into 20-30 visual scenes.
-Each scene = one distinct psychological concept or emotional beat.
-Group segments that continue the same idea; new scene when topic or emotion shifts.
-
-Emotional tone options (pick closest):
-  heavy trauma   -- grief, deep pain, childhood wounds
-  anxiety/stress -- worry, overthinking, pressure
-  growth/healing -- recovery, self-awareness, hope
-  breakthrough   -- sudden insight, turning point, realization
-  numbness       -- dissociation, emptiness, avoidance
-  neutral        -- background, transitions, factual
-
-Respond with a JSON array ONLY, no markdown, no explanation:
-[
-  {
-    "scene_index": 1,
-    "start": 0.0,
-    "end": 36.2,
-    "concept": "short label (3-5 words)",
-    "emotional_tone": "one of the six options above",
-    "combined_text": "full text of all segments in this scene",
-    "visual_description": "what the stick figure is doing — posture, gesture, objects, metaphor made literal"
-  }
-]"""
 
 def group_segments(segments: list[dict], deepseek_key: str) -> list[dict]:
     console.print("[bold]Step 1:[/] Grouping transcript into scenes with DeepSeek...")
@@ -220,29 +210,56 @@ def select_test_scenes(scenes: list[dict], max_seconds: float) -> list[dict]:
     return selected
 
 # ---------------------------------------------------------------------------
-# Image generation (gpt-image-1) — copied from generate.py
+# Dry run
 # ---------------------------------------------------------------------------
 
-PROMPT_SYSTEM = """You write DALL-E image generation prompts for a psychology YouTube whiteboard channel called TheInnerWar.
+def dry_run_scenes(scenes: list[dict]) -> None:
+    from rich.table import Table
+    console.print("\n[bold yellow]DRY RUN — No images will be generated[/]\n")
+    table = Table(title=f"Scene Plan ({len(scenes)} scenes)", show_lines=True)
+    table.add_column("#",       style="dim",     width=4)
+    table.add_column("Time",    style="cyan",    width=13)
+    table.add_column("Concept", style="bold",    width=26)
+    table.add_column("Tone",    style="magenta", width=20)
+    table.add_column("Visual",  width=55)
+    total_s = 0.0
+    for s in scenes:
+        total_s += float(s["end"]) - float(s["start"])
+        table.add_row(
+            str(s["scene_index"]),
+            f"{seconds_to_mmss(s['start'])}-{seconds_to_mmss(s['end'])}",
+            s["concept"],
+            s.get("emotional_tone", "neutral"),
+            s.get("visual_description", "")[:100],
+        )
+    console.print(table)
+    console.print(f"\n  Duration : {seconds_to_mmss(total_s)}")
+    console.print(f"  Images   : {len(scenes)} × ~$0.02 (Gemini flash) ≈ [green]${len(scenes) * 0.02:.2f}[/]")
+    console.print("\nRun without [yellow]--dry-run[/] to generate images.")
 
-Given a scene concept and script text, write ONE image generation prompt.
+# ---------------------------------------------------------------------------
+# Cost confirmation
+# ---------------------------------------------------------------------------
 
-Always start with EXACTLY this (do not change it):
-"whiteboard animation, black marker on white background, simple stick figure with perfectly round head, a bold jagged RED crack splitting from the crown of the head downward (this is mandatory and must be clearly visible), thin limbs, clean hand-drawn illustration, red crack is the only color, no shading, "
+def confirm_generation(n_scenes: int, style: str) -> bool:
+    img_cost = n_scenes * 0.02
+    console.print(f"\n[bold]Cost estimate:[/]")
+    console.print(f"  Images  ({n_scenes} × ~$0.02 Gemini flash): [green]${img_cost:.2f}[/]")
+    if style in ("aivid", "both"):
+        runway_cost = n_scenes * 0.25
+        console.print(f"  RunwayML ({n_scenes} × ~$0.25/clip):      [yellow]${runway_cost:.2f}[/]")
+        img_cost += runway_cost
+    console.print(f"  [bold]Total estimate: [green]${img_cost:.2f}[/][/bold]\n")
+    try:
+        answer = input("Proceed? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        console.print("\n[yellow]Aborted.[/]")
+        sys.exit(0)
+    return answer in ("y", "yes")
 
-Then describe the scene. IMPORTANT - vary the crack appearance to match the emotional tone:
-- Heavy trauma / dark topic -> "the red crack is deep, wide, and jagged, splitting far down the face"
-- Anxiety / stress -> "the red crack is sharp and branching, like a spiderweb fracture"
-- Growth / healing -> "the red crack is present but faint, with small lines stitching it together"
-- Realization / breakthrough -> "the red crack glows at the edges, as if light is coming through it"
-- Numbness / dissociation -> "the red crack is thin and barely visible, almost erased"
-
-Then describe:
-- What the stick figure is doing (posture, gesture, action)
-- Any objects, second characters (shadow self = solid black silhouette), or text labels
-- The psychological metaphor made literal and visual
-
-Keep it under 200 words. Output the prompt text only -- nothing else."""
+# ---------------------------------------------------------------------------
+# Prompt writing
+# ---------------------------------------------------------------------------
 
 def write_prompt(scene: dict, deepseek_key: str) -> str:
     user_msg = (
@@ -268,8 +285,11 @@ def write_prompt(scene: dict, deepseek_key: str) -> str:
     resp.raise_for_status()
     return resp.json()["choices"][0]["message"]["content"].strip()
 
+# ---------------------------------------------------------------------------
+# Image generation (Gemini via OpenRouter)
+# ---------------------------------------------------------------------------
+
 def generate_image(prompt: str, openrouter_key: str, retries: int = 2) -> bytes:
-    """Generate image via Gemini image model on OpenRouter."""
     for attempt in range(retries + 1):
         try:
             resp = httpx.post(
@@ -285,17 +305,14 @@ def generate_image(prompt: str, openrouter_key: str, retries: int = 2) -> bytes:
             if resp.status_code != 200:
                 raise RuntimeError(f"{resp.status_code} - {resp.text[:300]}")
 
-            # OpenRouter wraps Gemini images in message["images"], not message["content"]
             msg = resp.json()["choices"][0]["message"]
 
-            # Primary: message.images list (OpenRouter Gemini format)
             for img_part in msg.get("images") or []:
                 if img_part.get("type") == "image_url":
                     data_url = img_part["image_url"]["url"]
                     b64 = data_url.split(",", 1)[1]
                     return base64.b64decode(b64)
 
-            # Fallback: image parts embedded in content list
             content = msg.get("content", "")
             if isinstance(content, list):
                 for part in content:
@@ -304,7 +321,6 @@ def generate_image(prompt: str, openrouter_key: str, retries: int = 2) -> bytes:
                         b64 = data_url.split(",", 1)[1]
                         return base64.b64decode(b64)
 
-            # Fallback: content is a data URI string
             if isinstance(content, str) and content.startswith("data:image"):
                 b64 = content.split(",", 1)[1]
                 return base64.b64decode(b64)
@@ -319,7 +335,21 @@ def generate_image(prompt: str, openrouter_key: str, retries: int = 2) -> bytes:
                 raise RuntimeError(f"Gemini image timed out after {retries + 1} attempts") from e
 
 # ---------------------------------------------------------------------------
-# Audio extraction — copied from animate.py (with Windows .close() fix)
+# Paper grain overlay
+# ---------------------------------------------------------------------------
+
+def apply_paper_grain(img_bytes: bytes, strength: float = 0.03) -> bytes:
+    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    arr = np.array(img, dtype=np.float32)
+    rng = np.random.default_rng()
+    noise = rng.normal(0, strength * 255, arr.shape).astype(np.float32)
+    arr = np.clip(arr + noise, 0, 255).astype(np.uint8)
+    buf = io.BytesIO()
+    Image.fromarray(arr).save(buf, format="PNG")
+    return buf.getvalue()
+
+# ---------------------------------------------------------------------------
+# Audio extraction
 # ---------------------------------------------------------------------------
 
 def extract_audio(source_mp4: Path) -> Path:
@@ -346,7 +376,6 @@ def extract_audio(source_mp4: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 def apply_ken_burns(img_path: Path, duration: float, zoom: float = 1.08, direction: str = "in"):
-    """Return a moviepy VideoClip with a slow zoom-in or zoom-out effect."""
     from moviepy.editor import VideoClip
 
     img_pil = Image.open(str(img_path)).convert("RGB")
@@ -371,7 +400,6 @@ def apply_ken_burns(img_path: Path, duration: float, zoom: float = 1.08, directi
 # ---------------------------------------------------------------------------
 
 def apply_runway_video(img_path: Path, scene_idx: int, runway_key: str) -> Path:
-    """Submit image to RunwayML Gen-3, poll until done, return local mp4 path."""
     out_path = CLIPS_DIR / f"scene_{scene_idx:03d}.mp4"
     if out_path.exists():
         console.print(f"    skip scene {scene_idx} (clip exists)")
@@ -386,7 +414,6 @@ def apply_runway_video(img_path: Path, scene_idx: int, runway_key: str) -> Path:
         "Content-Type": "application/json",
     }
 
-    # Submit task
     resp = httpx.post(
         f"{RUNWAY_BASE}/image_to_video",
         headers=headers,
@@ -404,7 +431,6 @@ def apply_runway_video(img_path: Path, scene_idx: int, runway_key: str) -> Path:
     task_id = resp.json()["id"]
     console.print(f"    RunwayML task {task_id} submitted, polling...")
 
-    # Poll until SUCCEEDED or FAILED
     for attempt in range(30):  # up to 150s
         time.sleep(5)
         poll = httpx.get(
@@ -429,7 +455,7 @@ def apply_runway_video(img_path: Path, scene_idx: int, runway_key: str) -> Path:
     raise TimeoutError(f"RunwayML task {task_id} did not complete in 150s")
 
 # ---------------------------------------------------------------------------
-# Video assembly helpers
+# Video assembly
 # ---------------------------------------------------------------------------
 
 def assemble_kburns(scenes: list[dict], image_paths: list[Path], audio_path: Path) -> Path:
@@ -441,7 +467,6 @@ def assemble_kburns(scenes: list[dict], image_paths: list[Path], audio_path: Pat
         duration = float(scene["end"]) - float(scene["start"])
         direction = "in" if i % 2 == 0 else "out"
         clip = apply_ken_burns(img_path, duration, zoom=1.08, direction=direction)
-        # Crossfade into previous clip
         if i > 0:
             clip = clip.crossfadein(0.5)
         clips.append(clip)
@@ -480,7 +505,6 @@ def assemble_aivid(scenes: list[dict], clip_paths: list[Path], audio_path: Path)
     for scene, clip_path in zip(scenes, clip_paths):
         duration = float(scene["end"]) - float(scene["start"])
         raw = VideoFileClip(str(clip_path))
-        # Loop the 5s clip if scene is longer
         if raw.duration < duration:
             n_loops = int(duration / raw.duration) + 1
             looped = concatenate_videoclips([raw] * n_loops)
@@ -521,11 +545,12 @@ def assemble_aivid(scenes: list[dict], clip_paths: list[Path], audio_path: Path)
 def main():
     load_env()
 
-    parser = argparse.ArgumentParser(description="50s animation test: Ken Burns vs AI video")
+    parser = argparse.ArgumentParser(description="Phase 1 test: identity-locked character, 20s clip")
     parser.add_argument("--source",  default=None,   help="Source MP4 path")
-    parser.add_argument("--seconds", type=float, default=50.0, help="Test clip length in seconds")
+    parser.add_argument("--seconds", type=float, default=20.0, help="Test clip length in seconds")
     parser.add_argument("--style",   default="both", choices=["kburns", "aivid", "both"],
                         help="Animation style: kburns | aivid | both")
+    parser.add_argument("--dry-run", action="store_true", help="Preview scene plan, no images generated")
     args = parser.parse_args()
 
     source_mp4 = Path(args.source) if args.source else find_source_mp4()
@@ -535,21 +560,27 @@ def main():
 
     transcript_path = find_transcript(source_mp4)
 
-    # Require keys
     deepseek_key   = require_key("DEEPSEEK_API_KEY")
-    openrouter_key = require_key("OPENROUTER_API_KEY")
-    runway_key     = require_key("RUNWAYML_API_KEY") if args.style in ("aivid", "both") else None
+    openrouter_key = require_key("OPENROUTER_API_KEY") if not args.dry_run else None
+    runway_key     = require_key("RUNWAYML_API_KEY") if args.style in ("aivid", "both") and not args.dry_run else None
 
-    # Load + group + select
     segments = load_transcript(transcript_path)
     console.print(f"[bold]Loaded[/] {len(segments)} segments from [cyan]{transcript_path.name}[/]")
 
-    all_scenes   = group_segments(segments, deepseek_key)
-    test_scenes  = select_test_scenes(all_scenes, args.seconds)
+    all_scenes  = group_segments(segments, deepseek_key)
+    test_scenes = select_test_scenes(all_scenes, args.seconds)
 
     if not test_scenes:
         console.print("[red]ERROR:[/] No scenes fit within the requested duration.")
         sys.exit(1)
+
+    if args.dry_run:
+        dry_run_scenes(test_scenes)
+        return
+
+    if not confirm_generation(len(test_scenes), args.style):
+        console.print("[yellow]Cancelled.[/]")
+        sys.exit(0)
 
     # Set up output dirs
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -574,6 +605,7 @@ def main():
             prompt    = write_prompt(scene, deepseek_key)
             time.sleep(0.2)
             png_bytes = generate_image(prompt, openrouter_key)
+            png_bytes = apply_paper_grain(png_bytes)
             img_path.write_bytes(png_bytes)
             console.print(
                 f"  [green]OK[/] scene {idx} [{seconds_to_mmss(scene['start'])}] "
@@ -586,7 +618,7 @@ def main():
 
         time.sleep(0.5)
 
-    # Extract audio (shared by both styles)
+    # Extract audio
     console.print(f"\n[bold]Step 3:[/] Extracting audio...")
     audio_path = extract_audio(source_mp4)
 
