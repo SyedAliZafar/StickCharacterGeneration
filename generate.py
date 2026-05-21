@@ -50,11 +50,15 @@ DALLE_MODEL     = "gpt-image-1"
 DALLE_SIZE      = "1536x1024"   # closest 16:9 for gpt-image-1
 
 CHARACTER_STYLE = (
-    "whiteboard animation, black marker on white background, "
-    "simple stick figure with round head and thin limbs, "
-    "clean hand-drawn educational illustration, no color, no shading, "
-    "minimal line art, clear and simple composition, "
+    "off-white board animation, black marker on white background, "
+    "simple stick figure with perfectly round head, thin limbs, "
+    "IMPORTANT: the head must have a bold jagged red crack line splitting from crown downward, this red crack is mandatory in every image, "
+    "slightly uneven shoulders suggesting emotional weight, "
+    "clean hand-drawn educational illustration, red crack accent only, no other color, no shading, "
+    "minimal line art, expressive posture, clear composition, "
+    "TheInnerWar psychology channel brand, "
 )
+
 
 # ---------------------------------------------------------------------------
 # Environment
@@ -124,17 +128,9 @@ def load_transcript(path: Path) -> list[dict]:
 # Step 1 — DeepSeek groups segments into visual scenes
 # ---------------------------------------------------------------------------
 
-GROUP_SYSTEM = """You are a whiteboard video producer for a psychology YouTube channel.
+GROUP_SYSTEM = """You are a whiteboard video producer for a psychology YouTube channel called TheInnerWar.
 
-Given a full timestamped transcript, identify the distinct VISUAL SCENES needed.
-Each scene = one whiteboard image that a viewer sees for several seconds.
-
-Rules:
-- Aim for 20–30 scenes for a video under 10 minutes
-- Each scene covers ONE clear visual concept or metaphor
-- Group consecutive segments that share the same visual idea
-- Scenes must follow the narrative order of the script exactly
-- Use the actual start/end timestamps from the segments
+...same rules...
 
 Respond with a JSON array only — no markdown, no explanation:
 [
@@ -143,11 +139,11 @@ Respond with a JSON array only — no markdown, no explanation:
     "start": 0.0,
     "end": 36.2,
     "concept": "short label (3-5 words)",
+    "emotional_tone": "one of: heavy trauma | anxiety/stress | growth/healing | breakthrough | numbness | neutral",
     "combined_text": "full text of all segments in this scene combined",
-    "visual_description": "what should be drawn — describe the metaphor or concept visually"
+    "visual_description": "what should be drawn"
   }
 ]"""
-
 def group_segments(segments: list[dict], deepseek_key: str) -> list[dict]:
     console.print("[bold]Step 1:[/] Grouping segments into visual scenes with DeepSeek-V3...")
 
@@ -200,23 +196,31 @@ def group_segments(segments: list[dict], deepseek_key: str) -> list[dict]:
 # Step 2 — DeepSeek writes DALL-E prompt per scene
 # ---------------------------------------------------------------------------
 
-PROMPT_SYSTEM = """You write DALL-E 3 image generation prompts for whiteboard animation videos.
+PROMPT_SYSTEM = """You write DALL-E image generation prompts for a psychology YouTube whiteboard channel called TheInnerWar.
 
 Given a scene concept and script text, write ONE image generation prompt.
 
-Always start with:
-"whiteboard animation, black marker on white background, simple stick figure with round head and thin limbs, clean hand-drawn educational illustration, no color, no shading, "
+Always start with EXACTLY this (do not change it):
+"whiteboard animation, black marker on white background, simple stick figure with perfectly round head, a bold jagged RED crack splitting from the crown of the head downward (this is mandatory and must be clearly visible), thin limbs, clean hand-drawn illustration, red crack is the only color, no shading, "
+
+Then describe the scene. IMPORTANT — vary the crack appearance to match the emotional tone:
+- Heavy trauma / dark topic → "the red crack is deep, wide, and jagged, splitting far down the face"
+- Anxiety / stress → "the red crack is sharp and branching, like a spiderweb fracture"  
+- Growth / healing → "the red crack is present but faint, with small lines stitching it together"
+- Realization / breakthrough → "the red crack glows at the edges, as if light is coming through it"
+- Numbness / dissociation → "the red crack is thin and barely visible, almost erased"
 
 Then describe:
-- The central visual: what stick figures are doing, any objects, any text labels
+- What the stick figure is doing (posture, gesture, action)
+- Any objects, second characters (shadow self = solid black silhouette), or text labels
 - The psychological metaphor made literal and visual
-- Keep it under 200 words
 
-Output the prompt text only — nothing else."""
+Keep it under 200 words. Output the prompt text only — nothing else."""
 
 def write_prompt(scene: dict, deepseek_key: str) -> str:
     user_msg = (
         f"Concept: {scene['concept']}\n"
+        f"Emotional tone: {scene.get('emotional_tone', 'neutral/reflective')}\n"  # add this
         f"Visual description: {scene['visual_description']}\n"
         f"Script text: {scene['combined_text'][:400]}"
     )
@@ -258,7 +262,7 @@ def generate_image(prompt: str, openai_key: str) -> bytes:
             "size":    DALLE_SIZE,
             "quality": "medium",
         },
-        timeout=120,
+        timeout=240,  # gpt-image-1 can take 2-3 min on busy servers
     )
     if resp.status_code != 200:
         err = resp.json().get("error", {})
