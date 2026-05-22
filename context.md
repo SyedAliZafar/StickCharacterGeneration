@@ -8,9 +8,11 @@ NotebookLM
   → exports timestamped transcript (.txt)   ← this pipeline reads this
 
 stick_character_automation/
-  → reads transcript.txt
-  → generates ~25 whiteboard PNG frames
-  → output/frames/001_0s.png ...
+  → test_animate.py  → phase 1 test images + Ken Burns / AI video
+  → generate.py      → production gpt-image-1 frames
+  → animate.py       → code-rendered matplotlib animation (zero cost)
+  → output/phase1_test/  ← test output, never overwrites production
+  → output/frames/       ← production frames
 
 Video editor (CapCut / Premiere / FFmpeg)
   → syncs frames to audio timeline
@@ -23,133 +25,156 @@ Video editor (CapCut / Premiere / FFmpeg)
 
 | Folder | Purpose |
 |--------|---------|
-| `videoSequence/` | Sequences & deduplicates frames extracted from existing AI-generated videos |
-| `whiteboard-gen/` | Experimental — SVG + FLUX Schnell hybrid (cheaper, lower quality) |
-| `stick_character_automation/` | THIS — production pipeline, DALL-E 3, consistent character style |
+| `videoSequence/` | Sequences & deduplicates frames from existing AI-generated videos |
+| `whiteboard-gen/` | Experimental — SVG + FLUX Schnell hybrid |
+| `stick_character_automation/` | THIS — production pipeline |
 | `psych-youtube-automation/` | Script writing, ideation, NotebookLM prompts |
 | `ThumbnailGeneration/` | YouTube thumbnail creation |
 
 ---
 
-## Why gpt-image-1 (not FLUX Schnell)
+## Image Generation: Model Choices
 
-The psychology scripts are metaphor-heavy:
-- "anger is a heavily armored security guard protecting something soft"
-- "dry wood you've been carrying around"
-- "watching the storm from behind a window"
-- "lifeguard throwing a life preserver"
+### test_animate.py (Phase 1 test)
+Uses **Gemini 2.0 Flash image generation** directly via Google AI Studio (free tier):
+- Model: `gemini-2.0-flash-preview-image-generation`
+- Endpoint: `generativelanguage.googleapis.com/v1beta`
+- Key: `GEMINI_API_KEY` or `GOOGLE_API_KEY` (both accepted)
+- Free tier: ~1500 requests/day at 15 RPM
+- Falls back to OpenRouter (`OPENROUTER_API_KEY`) if no Gemini key is found
 
-FLUX Schnell (cheap, $0.003/image) cannot follow metaphorical prompts reliably.
-gpt-image-1 ($0.04/image at medium quality) understands nuanced scene descriptions.
+### generate.py (production)
+Uses **gpt-image-1** via OpenAI:
+- $0.04/image at medium quality, 1536×1024
+- Psychology metaphors need strong prompt understanding — Gemini flash is sufficient for tests, gpt-image-1 for final production
 
-For ~25 images per video: gpt-image-1 = **$1.00 total**. Not worth compromising quality.
+### Why not FLUX Schnell
+FLUX ($0.003/image) cannot reliably follow metaphorical prompts like
+"anger is a heavily armored security guard protecting something soft."
+gpt-image-1 / Gemini understand nuanced scene descriptions.
 
 ---
 
 ## Why DeepSeek for Grouping + Prompts
 
 - Calls `api.deepseek.com` directly with `DEEPSEEK_API_KEY`
-- DeepSeek-V3 is excellent at structured JSON output
+- DeepSeek-V3 excels at structured JSON output
 - ~4× cheaper than Claude Sonnet for this text task
-- Grouping cost: negligible (~$0.01 for the full script)
-- Claude reserved for vision tasks (frame matching in videoSequence)
+- Grouping cost: ~$0.01 for the full script
 
 ---
 
-## Why Group First
+## Scene Strategy: Group First, Then Cap by Tone
 
-A 518-second script has ~100 raw segments (3–8 seconds each).
-Most segments continue the same visual idea across 10–20 seconds.
-
+A 518-second script has ~100 raw segments (3–8s each).
 Generating one image per raw segment = 100 images = $4.00 + visual chaos.
-Grouping into scenes first = 25 images = $1.00 + clean visual storytelling.
 
-DeepSeek sees the entire script before deciding boundaries — it understands
-narrative arc, not just individual lines.
+**Step 1 — DeepSeek grouping**: understands narrative arc, produces 20–30 semantic scenes.
 
----
+**Step 2 — Tone-aware duration cap** (`split_long_scenes()`):
+Any scene longer than its emotional tone's cap is split into equal sub-scenes:
 
-## Character Style Decision — TheInnerWar Brand
+| Tone | Cap | Reasoning |
+|------|-----|-----------|
+| anxiety/stress | 3s | urgency → fast cuts |
+| breakthrough / neutral | 5s | baseline pacing |
+| growth/healing | 6s | contemplative but moving |
+| heavy trauma / numbness | 8s | viewer needs to sit with it |
 
-Every frame shares a consistent identity:
-- Whiteboard background, black marker line art
-- Stick figure with **perfectly round head**
-- **Bold jagged RED crack** from crown downward — mandatory in every image
-- Thin limbs, expressive posture; red is the only color, no shading
-
-The crack intensity maps to emotional tone (deep/branching/faint/glowing/erased).
-This is a brand requirement for TheInnerWar channel — do not remove it.
-
-The style is embedded in `PROMPT_SYSTEM` inside `write_prompt()`. The `CHARACTER_STYLE`
-constant at module level is currently unused (dead code).
+This matches TheInnerWar's retention-optimised editing rhythm:
+- Talking head baseline: 4–6s per image
+- Urgency/listing: 2–3s
+- Heavy emotional truth: 7–10s
 
 ---
 
-## API Keys Required
+## Character Identity — TheInnerWar Brand
 
-```
-OPENAI_API_KEY       ← gpt-image-1 image generation
-DEEPSEEK_API_KEY     ← DeepSeek-V3 grouping + prompt writing (api.deepseek.com)
-```
+The character is a **persistent mascot**, not redesigned per scene:
 
-`.env` lookup order: `./env` first, then `../videoSequence/.env` as fallback.
-All keys should already be in the `videoSequence/.env` shared file.
+- Warm paper background `#F5F1E8` — never white
+- Stick figure, perfectly round blank head — no face features
+- Bold jagged RED crack: always starts at crown, splits **downward-left**, same path every image
+- Thin uniform limbs, consistent line weight
+- Black marker line art only — no shading, no color except the crack
+- Asymmetrical composition: character in left or right third, never centered
+- Oppressive symbolic scale: objects dwarf the character
+
+Prompt templates are in `prompts/` — edit without touching Python code.
+
+---
+
+## .env Loading
+
+`.env` is read with `utf-8-sig` encoding (BOM-safe for Windows editors).
+Direct assignment (`os.environ[k] = v`) — not `setdefault` — so `.env` always wins
+over any stale system environment values.
+
+`_read_key_direct(*names)` bypasses `os.environ` entirely and reads `.env` directly
+as a final fallback, ensuring Gemini/OpenRouter keys are always found.
+
+`.env` lookup order: `./env` → `../videoSequence/.env`
 
 ---
 
 ## Estimated Cost Per Video
 
+### Test (test_animate.py, 20s clip)
 | Item | Cost |
 |------|------|
-| DeepSeek grouping + prompt writing (~100 segments) | ~$0.01 |
-| gpt-image-1 × 25 images (medium, 1536×1024) | ~$1.00 |
+| DeepSeek grouping | ~$0.01 |
+| Gemini image generation (direct) | free |
+| **Test total** | **~$0.01** |
+
+### Production (generate.py, full video)
+| Item | Cost |
+|------|------|
+| DeepSeek grouping + prompt writing | ~$0.01 |
+| gpt-image-1 × 25 images | ~$1.00 |
 | **Total per video** | **~$1.01** |
 
-At 4 videos/month = ~$4/month for all images.
+At 4 videos/month ≈ $4/month.
 
 ---
 
-## Future: When to Add Supabase
+## Code Map
 
-Add Supabase when:
-- Managing 5+ videos simultaneously
-- Want to avoid re-generating already-paid-for images
-- Want a web-based review UI (not just local files)
-- Going multi-channel
-
-Until then: JSON files + local folders is sufficient.
-
----
-
-## Code Map (`generate.py`)
+### test_animate.py
 
 | Function | Purpose |
 |----------|---------|
-| `load_env()` | Reads `.env` — checks local first, falls back to `../videoSequence/.env` |
-| `require_key(name)` | Exits with a clear message if an env var is missing |
-| `parse_txt(path)` | Parses `[HH:MM:SS.mmm --> HH:MM:SS.mmm] text` lines into `{start, end, text}` |
-| `parse_json(path)` | Parses a JSON segment array (alternative input format) |
-| `load_transcript(path)` | Dispatches to `parse_txt` or `parse_json` by file extension |
-| `group_segments(segments, key)` | Calls DeepSeek to group all segments into scenes (one API call) |
-| `write_prompt(scene, key)` | Calls DeepSeek to write a single gpt-image-1 prompt for a scene |
-| `generate_image(prompt, key)` | Calls OpenAI gpt-image-1, decodes base64, returns PNG bytes |
-| `dry_run(scenes, key)` | Prints scene table + cost estimate, no image API calls |
-| `main()` | Orchestrates everything; skips existing PNGs |
+| `_env_file_path()` | Finds `.env` — local first, then `../videoSequence/.env` |
+| `load_env()` | Reads `.env` with utf-8-sig, direct assignment to os.environ |
+| `_read_key_direct(*names)` | Reads key from os.environ then directly from .env as fallback |
+| `_load_prompt(filename)` | Loads prompt template from `prompts/` — exits if missing |
+| `chunk_by_interval(segments, interval, max_s)` | Fixed-interval slicing (--interval flag) |
+| `split_long_scenes(scenes)` | Splits scenes exceeding tone cap into equal sub-scenes |
+| `dry_run_scenes(scenes, provider)` | Prints scene table with Dur/Cap columns, zero cost |
+| `confirm_generation(n, style, provider)` | Prints cost estimate, waits for y/N |
+| `_generate_image_gemini_direct(prompt, key)` | Calls Google AI directly (free tier) |
+| `_generate_image_openrouter(prompt, key)` | Calls OpenRouter Gemini flash fallback |
+| `generate_image(prompt, key, provider)` | Dispatcher — routes to gemini_direct or openrouter |
+| `apply_paper_grain(img_bytes)` | Adds PIL/numpy noise for paper texture |
+| `apply_ken_burns(img_path, duration)` | moviepy zoom/pan clip |
+| `apply_runway_video(img_path, idx, key)` | RunwayML Gen3 image-to-video |
+| `assemble_kburns(scenes, images, audio)` | Concatenates Ken Burns clips with crossfade |
+| `assemble_aivid(scenes, clips, audio)` | Concatenates RunwayML clips |
+
+### generate.py
+
+| Function | Purpose |
+|----------|---------|
+| `load_env()` | Same pattern — local .env, videoSequence fallback |
+| `group_segments(segments, key)` | DeepSeek scene grouping |
+| `write_prompt(scene, key)` | DeepSeek → gpt-image-1 prompt |
+| `generate_image(prompt, key)` | OpenAI gpt-image-1, returns PNG bytes |
+| `dry_run(scenes)` | Scene table + cost estimate |
 
 ---
 
-## Known Issues / Incomplete Parts
+## Known Issues / Notes
 
-- **`GROUP_SYSTEM` prompt is a placeholder**: Line ~133 contains `"...same rules..."` — this
-  is a stub. The actual production prompt needs to specify grouping rules (scene count,
-  boundary logic, etc.). Scene quality improvements should start here.
-
-- **`CHARACTER_STYLE` constant is dead code**: Defined at module level but `write_prompt()`
-  embeds the style directly in `PROMPT_SYSTEM`. The constant is never used.
-
-- **`dry_run()` parameter name is misleading**: Signature is `dry_run(scenes, openrouter_key)`
-  but the caller passes `deepseek_key`. Harmless — the key isn't used in dry run — but
-  the parameter name is wrong.
-
-- **Sibling project references in context.md are aspirational**: `whiteboard-gen/`,
-  `psych-youtube-automation/`, and `ThumbnailGeneration/` may not exist yet.
+- `GROUP_SYSTEM` in `generate.py` (line ~133) still contains a placeholder stub — production grouping quality improvements should start there
+- `CHARACTER_STYLE` constant in `generate.py` is dead code — style is embedded in `PROMPT_SYSTEM`
+- RunwayML `gen3a_turbo` outputs 1280×768; Ken Burns uses original image resolution
+- `moviepy<2.0` pinned — v2 has breaking API changes

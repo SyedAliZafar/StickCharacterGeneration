@@ -10,7 +10,43 @@ Channel brand: **TheInnerWar** — psychology content. Every character has a bol
 
 ---
 
-## Pipeline
+## Scripts
+
+| Script | Purpose |
+|--------|---------|
+| `test_animate.py` | Phase 1 test — identity-locked character, tone-capped scene durations, Ken Burns / RunwayML video |
+| `generate.py` | Production — gpt-image-1 image generation from transcript |
+| `animate.py` | Code-rendered animation via matplotlib — zero image cost |
+
+---
+
+## test_animate.py Pipeline
+
+```
+Step 1 — Auto-detect first MP4 + transcript in video/
+Step 2 — DeepSeek groups transcript into semantic scenes
+Step 3 — split_long_scenes() caps each scene by emotional tone
+Step 4 — DeepSeek writes a Gemini image prompt per scene
+Step 5 — Gemini generates images (free via GEMINI_API_KEY, or ~$0.02 via OpenRouter)
+Step 6 — apply_paper_grain() adds subtle paper texture overlay (PIL)
+Step 7 — Assemble Ken Burns or RunwayML video
+Step 8 — Save to output/phase1_test/
+```
+
+### Tone → Scene Duration Cap
+
+| Tone | Max duration |
+|------|-------------|
+| anxiety/stress | 3s |
+| breakthrough / neutral | 5s |
+| growth/healing | 6s |
+| heavy trauma / numbness | 8s |
+
+Any scene exceeding its cap is split into equal sub-scenes automatically.
+
+---
+
+## generate.py Pipeline
 
 ```
 Step 1 — Parse NotebookLM .txt transcript → raw segments [{start, end, text}]
@@ -25,10 +61,11 @@ Step 6 — Save output/results.json (scene, timestamp, prompt, cost, path)
 
 ## Tech Stack
 - **Python 3.11+** with `uv run` (PEP 723 inline deps, no manual venv)
-- **DeepSeek-V3** via `api.deepseek.com` directly — groups segments + writes prompts
-- **gpt-image-1** via OpenAI — generates whiteboard stick figure images (returns base64)
-- **httpx** — all API calls
-- **Pillow** — listed as dep, not currently used in main path
+- **DeepSeek-V3** via `api.deepseek.com` — groups segments + writes prompts
+- **Gemini 2.0 Flash** via Google AI Studio (free) or OpenRouter (~$0.02/image)
+- **gpt-image-1** via OpenAI — production image generation (generate.py only)
+- **moviepy** — Ken Burns zoom/pan + video assembly
+- **Pillow + numpy** — paper grain overlay
 - **rich** — terminal progress display
 
 ---
@@ -37,14 +74,13 @@ Step 6 — Save output/results.json (scene, timestamp, prompt, cost, path)
 
 | File | Description |
 |------|-------------|
-| `transcript.txt` | NotebookLM export — timestamped lines `[HH:MM:SS.mmm --> HH:MM:SS.mmm] text` |
+| `video/*.mp4` | Source video — auto-detected by test_animate.py |
+| `video/*.txt` | NotebookLM transcript — same stem as MP4, preferred over .json |
 | `.env` | API keys |
+| `prompts/group_system.txt` | DeepSeek scene-grouping system prompt |
+| `prompts/prompt_system.txt` | Identity-locked image generation prompt |
 
-Accepts both:
-- `.txt` — NotebookLM timestamped format (primary)
-- `.json` — segment array `[{start, end, text}]` (also supported)
-
-`.env` lookup order: `./env` → `../videoSequence/.env`
+`.env` lookup: `./env` → `../videoSequence/.env`
 
 ---
 
@@ -52,8 +88,13 @@ Accepts both:
 
 ```
 output/
-├── frames/        ← 001_0s.png, 002_36s.png, ... (1536×1024 PNGs)
-└── results.json   ← full log: scene, timestamp range, prompt, cost, file path
+├── frames/           ← generate.py: 001_0s.png, ... (1536×1024)
+├── results.json      ← generate.py: scene log
+└── phase1_test/
+    ├── images/       ← test_animate.py: scene_001.png, ...
+    ├── aivid_clips/  ← RunwayML clips
+    ├── kburns.mp4
+    └── aivid.mp4
 ```
 
 ---
@@ -61,67 +102,68 @@ output/
 ## Environment Variables
 
 ```
-DEEPSEEK_API_KEY=...     ← required (DeepSeek-V3 scene grouping + prompt writing)
-OPENAI_API_KEY=sk-proj-... ← required (gpt-image-1 image generation)
+DEEPSEEK_API_KEY=...         ← required for all scripts (scene grouping)
+GEMINI_API_KEY=AIza...       ← free tier, ~1500 req/day — test_animate.py prefers this
+GOOGLE_API_KEY=AIza...       ← accepted as alias for GEMINI_API_KEY
+OPENROUTER_API_KEY=sk-or-... ← fallback if no Gemini key (~$0.02/image)
+OPENAI_API_KEY=sk-proj-...   ← required for generate.py (gpt-image-1)
+RUNWAYML_API_KEY=...         ← only for --style aivid
 ```
 
-> Note: despite CLAUDE.md history saying `OPENROUTER_API_KEY`, the code calls
-> `api.deepseek.com` directly and reads `DEEPSEEK_API_KEY`.
+`GEMINI_API_KEY` and `GOOGLE_API_KEY` are both accepted — whichever is in `.env`.
 
 ---
 
 ## Models
 
-| Task | Model | Endpoint | Cost |
-|------|-------|----------|------|
-| Segment grouping + prompt writing | `deepseek-chat` | `api.deepseek.com` | ~$0.01 total |
-| Image generation | `gpt-image-1` | `api.openai.com` | $0.04/image |
-| **Typical video (~25 scenes)** | | | **~$1.00** |
+| Task | Model | Cost |
+|------|-------|------|
+| Scene grouping + prompt writing | `deepseek-chat` | ~$0.01/video |
+| Image generation (test) | `gemini-2.0-flash-preview-image-generation` | free (direct) |
+| Image generation (test fallback) | `gemini-2.5-flash-image` via OpenRouter | ~$0.02/image |
+| Image generation (production) | `gpt-image-1` via OpenAI | ~$0.04/image |
+| AI video clips | RunwayML Gen3 Turbo | ~$0.25/clip |
 
 ---
 
 ## Running
 
 ```bash
-# 1. Add API keys to .env
-# 2. Place your NotebookLM transcript as transcript.txt
+# test_animate.py — dry run first (zero cost)
+uv run test_animate.py --dry-run
+uv run test_animate.py --style kburns
+uv run test_animate.py --style kburns --seconds 50
 
-uv run generate.py
-
-# Dry run — shows scenes DeepSeek would generate, no images, no cost:
-uv run generate.py --dry-run
-
-# Custom transcript path:
-uv run generate.py --transcript path/to/my_script.txt
+# generate.py — production
+uv run generate.py --dry-run --transcript video/my.txt
+uv run generate.py --transcript video/my.txt
 ```
 
 ---
 
-## Character Style (consistent across all videos)
+## Character Style (identity-locked across all videos)
 
 Every image has:
-- Whiteboard background, black marker line art
-- Stick figure with a **perfectly round head**
-- **Bold jagged RED crack** splitting from crown downward — mandatory in every frame
-- Thin limbs, expressive posture
-- No other color, no shading
+- **Warm paper background `#F5F1E8`** — never white
+- Stick figure with a **perfectly round blank head** — no face features
+- **Bold jagged RED crack** always starting at crown, splitting **downward-left** — same path every scene
+- Thin uniform limbs, consistent line thickness
+- No other color, no shading, no polished cartoon style
 
-The red crack intensity varies by emotional tone:
-- **Heavy trauma** → deep, wide, jagged crack splitting far down the face
-- **Anxiety/stress** → sharp branching crack, spiderweb fracture
-- **Growth/healing** → faint crack with small stitching lines
-- **Breakthrough** → crack glows at edges, light coming through
-- **Numbness** → thin, barely visible, almost erased
+Crack intensity varies by emotional tone (deep/branching/faint/glowing/erased).
+Composition: asymmetrical framing, character in left/right third, large negative space.
+
+Prompt templates live in `prompts/` — edit the `.txt` files without touching Python.
 
 ---
 
 ## Key Design Decisions
 
-- **Group first, generate second**: DeepSeek sees the full script before deciding scene
-  boundaries — far better grouping than processing segment-by-segment
-- **gpt-image-1 over FLUX**: Psychology metaphors need strong prompt understanding;
-  gpt-image-1 follows complex metaphorical descriptions reliably
-- **Dry run flag**: Review scene breakdown and prompts before spending any money
-- **Skip existing frames**: Re-running is safe — already-generated PNGs are skipped
-- **1536×1024 output**: Closest gpt-image-1 size to 1920×1080 (16:9 widescreen)
-- **base64 response**: `gpt-image-1` returns `b64_json`; image bytes decoded before saving
+- **Group first, generate second**: DeepSeek sees full script before deciding scene boundaries
+- **Tone-aware duration caps**: anxiety scenes cut fast (3s), trauma lingers (8s)
+- **Prompt files external**: `prompts/group_system.txt` + `prompts/prompt_system.txt` — iterate without code changes
+- **Paper grain overlay**: PIL/numpy noise applied to every generated PNG before saving
+- **Free image generation first**: GEMINI_API_KEY (direct Google API) tried before OpenRouter
+- **Dry run + cost confirmation**: always preview before spending money
+- **Phase 1 test isolated**: all test output in `output/phase1_test/` — never overwrites production
+- **utf-8-sig encoding**: `.env` read with BOM-safe encoding to handle Windows editors

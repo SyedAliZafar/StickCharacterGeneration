@@ -4,13 +4,21 @@ Group the transcript segments into 20-30 visual scenes.
 Each scene = one distinct psychological concept or emotional beat.
 Group segments that continue the same idea; new scene when topic or emotion shifts.
 
-Emotional tone options (pick closest):
-  heavy trauma   -- grief, deep pain, childhood wounds
-  anxiety/stress -- worry, overthinking, pressure
-  growth/healing -- recovery, self-awareness, hope
-  breakthrough   -- sudden insight, turning point, realization
-  numbness       -- dissociation, emptiness, avoidance
-  neutral        -- background, transitions, factual
+Emotional tone options — pick the CLOSEST match, not the default:
+  heavy trauma   -- grief, deep pain, childhood wounds, loss, abuse described directly, feeling broken/destroyed
+  anxiety/stress -- ACTIVE spiraling only: racing thoughts, panic, chest tightening, dread in the moment
+  growth/healing -- recovery, self-awareness, self-compassion, therapy insight, acceptance, hope emerging
+  breakthrough   -- sudden "aha" realization, a shift in perspective, turning point stated clearly
+  numbness       -- emotional shutdown, dissociation, emptiness, going through the motions, flat affect
+  neutral        -- factual explanation, background context, introducing a concept, no strong emotional charge
+
+TONE ASSIGNMENT RULES — follow strictly:
+- Do NOT default to anxiety/stress. Use it only when the speaker describes active spiraling, panic, or racing thoughts RIGHT NOW.
+- Past pain described calmly = heavy trauma, not anxiety.
+- Emptiness or disconnection = numbness, not anxiety.
+- Explaining a concept without emotion = neutral, not anxiety.
+- Any moment of insight, self-awareness, or "I realized" = growth/healing or breakthrough.
+- A typical transcript must contain at least 3 different tones. If your output uses only one or two tones, you have made an error — re-read and redistribute.
 
 Respond with a JSON array ONLY, no markdown, no explanation:
 [
