@@ -44,7 +44,7 @@ from pathlib import Path
 
 import httpx
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter
 from rich.console import Console
 from rich.progress import track
 
@@ -62,6 +62,7 @@ PROMPTS_LOG = OUTPUT_DIR / "prompts_used.txt"
 OUT_KBURNS  = OUTPUT_DIR / "kburns.mp4"
 OUT_AIVID       = OUTPUT_DIR / "aivid.mp4"
 OUT_KBURNS_P2   = OUTPUT_DIR / "kburns_phase2.mp4"
+OUT_KBURNS_P3   = OUTPUT_DIR / "kburns_phase3.mp4"
 
 PAPER_TONE = (245, 241, 232)  # #F5F1E8
 
@@ -559,7 +560,7 @@ def _apply_ken_burns_legacy(img_path: Path, duration: float, zoom: float = 1.08,
 # Phase 2 — tone-driven Ken Burns (PIL/numpy, returns frames)
 # ---------------------------------------------------------------------------
 
-def apply_ken_burns(img_path: Path, duration: float, tone: str = "neutral") -> list[np.ndarray]:
+def _apply_ken_burns_phase2(img_path: Path, duration: float, tone: str = "neutral") -> list[np.ndarray]:
     """Return RGB numpy frames with tone-driven camera motion and per-frame film grain."""
     img = Image.open(str(img_path)).convert("RGB")
     W, H = img.size
@@ -699,7 +700,7 @@ def assemble_kburns_phase2(scenes: list[dict], image_paths: list[Path], audio_pa
             trans_log[kind] = trans_log.get(kind, 0) + 1
             all_frames.extend(make_transition(prev_arr, curr_arr, prev_tone, tone))
 
-        all_frames.extend(apply_ken_burns(img_path, duration, tone))
+        all_frames.extend(_apply_ken_burns_phase2(img_path, duration, tone))
         cam_log[tone] = cam_log.get(tone, 0) + 1
         prev_arr  = curr_arr
         prev_tone = tone
@@ -739,6 +740,264 @@ def assemble_kburns_phase2(scenes: list[dict], image_paths: list[Path], audio_pa
     console.print(f"  Transitions      : {trans_log}")
     console.print(f"  [green]OK[/] {OUT_KBURNS_P2}")
     return OUT_KBURNS_P2
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — intensity scoring
+# ---------------------------------------------------------------------------
+
+def intensity_score(scene_index: int, total_scenes: int) -> float:
+    """Return 0.0 → 1.0 based on position in video."""
+    if total_scenes <= 1:
+        return 0.0
+    return (scene_index - 1) / (total_scenes - 1)
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — procedural overlays (PIL/numpy only)
+# ---------------------------------------------------------------------------
+
+def apply_overlays(img_pil: Image.Image, tone: str, intensity: float = 0.0) -> Image.Image:
+    """Apply film grain, vignette, and crack glow pulse to a PIL image."""
+    arr = np.array(img_pil, dtype=np.float32)
+    H, W = arr.shape[:2]
+
+    # Film grain
+    grain_std = 8.0 + intensity * 6.0
+    rng = np.random.default_rng()
+    noise = rng.normal(0, grain_std, arr.shape).astype(np.float32)
+    arr = np.clip(arr + noise, 0, 255)
+
+    # Vignette — multiply layer, max darkening at corners
+    vignette_strength = 0.35 + intensity * 0.20
+    cx, cy = W / 2.0, H / 2.0
+    Y_idx, X_idx = np.mgrid[0:H, 0:W]
+    dist = np.sqrt(((X_idx - cx) / cx) ** 2 + ((Y_idx - cy) / cy) ** 2)
+    vignette = 1.0 - vignette_strength * np.minimum(dist, 1.0)
+    arr = arr * vignette[:, :, np.newaxis]
+    arr = np.clip(arr, 0, 255)
+
+    result = Image.fromarray(arr.astype(np.uint8))
+
+    # Crack glow pulse: breakthrough and heavy trauma only
+    tone_key = tone.lower().strip()
+    if "breakthrough" in tone_key or "trauma" in tone_key:
+        glow = Image.new("RGBA", result.size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(glow)
+        gx, gy, radius = W // 2, H // 3, 40
+        opacity = int(255 * 0.15)
+        draw.ellipse(
+            [gx - radius, gy - radius, gx + radius, gy + radius],
+            fill=(216, 90, 48, opacity),
+        )
+        result = Image.alpha_composite(result.convert("RGBA"), glow).convert("RGB")
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — emotional Ken Burns (PIL, returns list of PIL Images)
+# ---------------------------------------------------------------------------
+
+def apply_ken_burns(img_pil: Image.Image, tone: str, duration_s: float,
+                    fps: int = 24, intensity: float = 0.0) -> list:
+    """Return list of PIL Images with tone-driven camera motion."""
+    W, H = img_pil.size
+    n_frames = max(1, int(round(duration_s * fps)))
+    drift_scale = 1.0 + intensity * 0.3
+    tone_key = tone.lower().strip()
+    frames = []
+
+    for i in range(n_frames):
+        t = i / max(n_frames - 1, 1)
+
+        if "trauma" in tone_key:
+            zoom = 1.0 + 0.12 * t
+            dx, dy = 0, int(8 * t * drift_scale)
+        elif "anxiety" in tone_key:
+            zoom = 1.0 + 0.06 * t
+            jitter_rng = random.Random((i // 6) * 7919)
+            dx = jitter_rng.randint(-2, 2)
+            dy = jitter_rng.randint(-2, 2)
+        elif "growth" in tone_key:
+            zoom = 1.0
+            dx = int((-6 + 12 * t) * drift_scale)
+            dy = 0
+        elif "breakthrough" in tone_key:
+            zoom = 1.08 - 0.08 * t
+            dx = 0
+            dy = int(-10 * t * drift_scale)
+        elif "numbness" in tone_key:
+            zoom = 1.0 - 0.06 * t
+            dx, dy = 0, int(4 * t * drift_scale)
+        else:  # neutral
+            zoom = 1.0 + 0.05 * t
+            dx = int(8 * t * drift_scale)
+            dy = int(4 * t * drift_scale)
+
+        if zoom >= 1.0:
+            crop_w = max(1, int(W / zoom))
+            crop_h = max(1, int(H / zoom))
+            cx = W // 2 + dx
+            cy = H // 2 + dy
+            x1 = max(0, min(cx - crop_w // 2, W - crop_w))
+            y1 = max(0, min(cy - crop_h // 2, H - crop_h))
+            frame = img_pil.crop((x1, y1, x1 + crop_w, y1 + crop_h)).resize((W, H), Image.LANCZOS)
+        else:
+            # Zoom out: pad with paper tone then crop to simulate pulling back
+            expand_w = max(W, int(W / zoom))
+            expand_h = max(H, int(H / zoom))
+            padded = Image.new("RGB", (expand_w, expand_h), PAPER_TONE)
+            ox = max(0, min((expand_w - W) // 2 - dx, expand_w - W))
+            oy = max(0, min((expand_h - H) // 2 - dy, expand_h - H))
+            padded.paste(img_pil, (ox, oy))
+            frame = padded.resize((W, H), Image.LANCZOS)
+
+        frames.append(frame)
+
+    return frames
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — shadow self post-process
+# ---------------------------------------------------------------------------
+
+def apply_shadow_self(img_pil: Image.Image) -> Image.Image:
+    """Darken and blur the right half to simulate the shadow self."""
+    W, H = img_pil.size
+    right = img_pil.crop((W // 2, 0, W, H))
+    overlay = Image.new("RGBA", right.size, (26, 26, 26, int(255 * 0.25)))
+    composited = Image.alpha_composite(right.convert("RGBA"), overlay).convert("RGB")
+    blurred = composited.filter(ImageFilter.GaussianBlur(radius=1))
+    result = img_pil.copy()
+    result.paste(blurred, (W // 2, 0))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — scene transitions (PIL)
+# ---------------------------------------------------------------------------
+
+def shadow_fade_p3(out_pil: Image.Image, in_pil: Image.Image, n: int = 18) -> list:
+    """Fade out → paper tone → fade in using PIL Image.blend()."""
+    paper = Image.new("RGB", out_pil.size, PAPER_TONE)
+    half = n // 2
+    frames = []
+    for i in range(half):
+        frames.append(Image.blend(out_pil, paper, (i + 1) / half))
+    for i in range(n - half):
+        frames.append(Image.blend(paper, in_pil, (i + 1) / (n - half)))
+    return frames
+
+
+def crack_spread_p3(out_pil: Image.Image, in_pil: Image.Image, n: int = 12) -> list:
+    """Red vertical line grows top-to-bottom over n-1 frames, then snaps to incoming image."""
+    W, H = out_pil.size
+    frames = []
+    for i in range(n - 1):
+        frame = out_pil.copy()
+        draw = ImageDraw.Draw(frame)
+        y_end = int(H * (i + 1) / (n - 1))
+        draw.line([(W // 2, 0), (W // 2, y_end)], fill=(216, 90, 48), width=3)
+        frames.append(frame)
+    frames.append(in_pil.copy())
+    return frames
+
+
+def make_transition_p3(out_pil: Image.Image, in_pil: Image.Image, out_tone: str) -> list:
+    if "anxiety" in out_tone.lower():
+        return crack_spread_p3(out_pil, in_pil)
+    return shadow_fade_p3(out_pil, in_pil)
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — video assembly
+# ---------------------------------------------------------------------------
+
+def assemble_kburns_phase3(scenes: list[dict], image_paths: list[Path], audio_path: Path) -> Path:
+    from moviepy.editor import VideoClip, AudioFileClip
+
+    console.print("\n[bold]Assembling Ken Burns Phase 3 video...[/]")
+
+    all_pil_frames: list = []
+    prev_last_frame = None
+    prev_tone = ""
+    total_scenes = len(scenes)
+    summary_rows: list[tuple] = []
+
+    for scene, img_path in zip(scenes, image_paths):
+        scene_idx   = scene["scene_index"]
+        tone        = scene.get("emotional_tone", "neutral").lower().strip()
+        duration    = float(scene["end"]) - float(scene["start"])
+        show_shadow = scene.get("show_shadow", False)
+        intensity   = intensity_score(scene_idx, total_scenes)
+
+        img_pil = Image.open(str(img_path)).convert("RGB")
+
+        if show_shadow:
+            img_pil = apply_shadow_self(img_pil)
+
+        img_pil = apply_overlays(img_pil, tone, intensity)
+
+        transition_used = "none"
+        if prev_last_frame is not None:
+            transition_frames = make_transition_p3(prev_last_frame, img_pil, prev_tone)
+            all_pil_frames.extend(transition_frames)
+            transition_used = "crack_spread" if "anxiety" in prev_tone else "shadow_fade"
+
+        kb_frames = apply_ken_burns(img_pil, tone, duration, fps=FPS, intensity=intensity)
+        all_pil_frames.extend(kb_frames)
+
+        prev_last_frame = kb_frames[-1] if kb_frames else img_pil
+        prev_tone = tone
+
+        overlay_desc = (
+            "crack_glow+grain+vignette" if ("breakthrough" in tone or "trauma" in tone)
+            else "grain+vignette"
+        )
+        if show_shadow:
+            overlay_desc += "+shadow_self"
+        summary_rows.append((scene_idx, tone, round(intensity, 2), transition_used, overlay_desc))
+
+    if not all_pil_frames:
+        console.print("[red]ERROR:[/] No frames generated.")
+        return OUT_KBURNS_P3
+
+    total = len(all_pil_frames)
+    np_frames = [np.array(f) for f in all_pil_frames]
+
+    def make_frame(t: float) -> np.ndarray:
+        return np_frames[min(int(t * FPS), total - 1)]
+
+    video = VideoClip(make_frame, duration=total / FPS).set_fps(FPS)
+    audio = AudioFileClip(str(audio_path))
+    final_dur = min(video.duration, audio.duration)
+    video = video.subclip(0, final_dur)
+    audio = audio.subclip(0, final_dur)
+    final = video.set_audio(audio)
+
+    console.print(f"  Writing [cyan]{OUT_KBURNS_P3.name}[/] ...")
+    final.write_videofile(
+        str(OUT_KBURNS_P3),
+        fps=FPS,
+        codec="libx264",
+        audio_codec="aac",
+        temp_audiofile=str(OUTPUT_DIR / "_tmp_p3_audio.m4a"),
+        remove_temp=True,
+        logger=None,
+    )
+    final.close(); audio.close(); video.close()
+
+    console.print(f"\n[bold green]Phase 3 Summary:[/]")
+    console.print(f"  Scenes       : {len(scenes)}")
+    console.print(f"  Total frames : {total}")
+    for row in summary_rows:
+        console.print(
+            f"  scene_{row[0]:03d}  tone={row[1]}  intensity={row[2]:.2f}  "
+            f"transition={row[3]}  overlay={row[4]}"
+        )
+    console.print(f"  [green]OK[/] {OUT_KBURNS_P3}")
+    return OUT_KBURNS_P3
 
 
 # ---------------------------------------------------------------------------
@@ -1075,6 +1334,7 @@ def main():
     # Ken Burns
     if args.style in ("kburns", "both"):
         assemble_kburns_phase2(assembled_scenes, image_paths, audio_path)
+        assemble_kburns_phase3(assembled_scenes, image_paths, audio_path)
 
     # AI Video
     if args.style in ("aivid", "both"):
@@ -1098,14 +1358,15 @@ def main():
 
     console.print("\n[bold green]Done.[/]")
     if args.style in ("kburns", "both"):
-        console.print(f"  Ken Burns -> [cyan]{OUT_KBURNS_P2}[/]")
+        console.print(f"  Ken Burns P2 -> [cyan]{OUT_KBURNS_P2}[/]")
+        console.print(f"  Ken Burns P3 -> [cyan]{OUT_KBURNS_P3}[/]")
     if args.style in ("aivid", "both"):
         console.print(f"  AI Video  -> [cyan]{OUT_AIVID}[/]")
-    console.print(f"  Scenes    : {len(test_scenes)}")
+    console.print(f"  Scenes    : {len(assembled_scenes)}")
     console.print(f"  Images    : [cyan]{IMAGES_DIR}[/]")
     console.print(f"  Prompts   : [cyan]{PROMPTS_LOG}[/]")
     console.print("\n[bold]Scenes produced:[/]")
-    for s in test_scenes:
+    for s in assembled_scenes:
         console.print(
             f"  scene_{s['scene_index']:03d}  "
             f"[cyan]{seconds_to_mmss(s['start'])}-{seconds_to_mmss(s['end'])}[/]  "
