@@ -20,6 +20,12 @@ TONE ASSIGNMENT RULES — follow strictly:
 - Any moment of insight, self-awareness, or "I realized" = growth/healing or breakthrough.
 - A typical transcript must contain at least 3 different tones. If your output uses only one or two tones, you have made an error — re-read and redistribute.
 
+VISUAL DESCRIPTION RULE — mandatory:
+Always describe the scene as ONE character interacting with symbolic objects.
+Never describe multiple characters performing separate actions.
+If the concept has three steps, describe one character standing between or
+reacting to three symbolic objects.
+
 Respond with a JSON array ONLY, no markdown, no explanation:
 [
   {

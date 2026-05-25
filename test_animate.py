@@ -31,12 +31,14 @@ Usage:
 
 import argparse
 import base64
+import hashlib
 import io
 import json
 import math
 import os
 import random
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -44,7 +46,7 @@ from pathlib import Path
 
 import httpx
 import numpy as np
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 from rich.console import Console
 from rich.progress import track
 
@@ -63,6 +65,10 @@ OUT_KBURNS  = OUTPUT_DIR / "kburns.mp4"
 OUT_AIVID       = OUTPUT_DIR / "aivid.mp4"
 OUT_KBURNS_P2   = OUTPUT_DIR / "kburns_phase2.mp4"
 OUT_KBURNS_P3   = OUTPUT_DIR / "kburns_phase3.mp4"
+OUT_KBURNS_P4   = OUTPUT_DIR / "kburns_phase4.mp4"
+OUT_THUMBNAIL   = ROOT / "output" / "thumbnail.png"
+CACHE_FILE      = ROOT / "output" / "prompt_cache.json"
+REJECTIONS_LOG  = OUTPUT_DIR / "rejections.log"
 
 PAPER_TONE = (245, 241, 232)  # #F5F1E8
 
@@ -757,7 +763,8 @@ def intensity_score(scene_index: int, total_scenes: int) -> float:
 # Phase 3 — procedural overlays (PIL/numpy only)
 # ---------------------------------------------------------------------------
 
-def apply_overlays(img_pil: Image.Image, tone: str, intensity: float = 0.0) -> Image.Image:
+def apply_overlays(img_pil: Image.Image, tone: str, intensity: float = 0.0,
+                   motion: str = "normal") -> Image.Image:
     """Apply film grain, vignette, and crack glow pulse to a PIL image."""
     arr = np.array(img_pil, dtype=np.float32)
     H, W = arr.shape[:2]
@@ -768,8 +775,11 @@ def apply_overlays(img_pil: Image.Image, tone: str, intensity: float = 0.0) -> I
     noise = rng.normal(0, grain_std, arr.shape).astype(np.float32)
     arr = np.clip(arr + noise, 0, 255)
 
-    # Vignette — multiply layer, max darkening at corners
-    vignette_strength = 0.35 + intensity * 0.20
+    # Vignette — cinematic forces 50%, otherwise intensity-scaled
+    if motion == "cinematic":
+        vignette_strength = 0.50
+    else:
+        vignette_strength = 0.35 + intensity * 0.20
     cx, cy = W / 2.0, H / 2.0
     Y_idx, X_idx = np.mgrid[0:H, 0:W]
     dist = np.sqrt(((X_idx - cx) / cx) ** 2 + ((Y_idx - cy) / cy) ** 2)
@@ -779,9 +789,9 @@ def apply_overlays(img_pil: Image.Image, tone: str, intensity: float = 0.0) -> I
 
     result = Image.fromarray(arr.astype(np.uint8))
 
-    # Crack glow pulse: breakthrough and heavy trauma only
+    # Crack glow pulse: breakthrough/trauma always; cinematic mode: all tones
     tone_key = tone.lower().strip()
-    if "breakthrough" in tone_key or "trauma" in tone_key:
+    if motion == "cinematic" or "breakthrough" in tone_key or "trauma" in tone_key:
         glow = Image.new("RGBA", result.size, (0, 0, 0, 0))
         draw = ImageDraw.Draw(glow)
         gx, gy, radius = W // 2, H // 3, 40
@@ -800,38 +810,46 @@ def apply_overlays(img_pil: Image.Image, tone: str, intensity: float = 0.0) -> I
 # ---------------------------------------------------------------------------
 
 def apply_ken_burns(img_pil: Image.Image, tone: str, duration_s: float,
-                    fps: int = 24, intensity: float = 0.0) -> list:
+                    fps: int = 24, intensity: float = 0.0,
+                    motion: str = "normal") -> list:
     """Return list of PIL Images with tone-driven camera motion."""
     W, H = img_pil.size
     n_frames = max(1, int(round(duration_s * fps)))
     drift_scale = 1.0 + intensity * 0.3
     tone_key = tone.lower().strip()
+
+    zoom_scale   = {"low": 0.4, "normal": 1.0, "cinematic": 1.4}.get(motion, 1.0)
+    jitter_scale = {"low": 0,   "normal": 1,   "cinematic": 2  }.get(motion, 1)
+
     frames = []
 
     for i in range(n_frames):
         t = i / max(n_frames - 1, 1)
 
         if "trauma" in tone_key:
-            zoom = 1.0 + 0.12 * t
+            zoom = 1.0 + 0.12 * zoom_scale * t
             dx, dy = 0, int(8 * t * drift_scale)
         elif "anxiety" in tone_key:
-            zoom = 1.0 + 0.06 * t
-            jitter_rng = random.Random((i // 6) * 7919)
-            dx = jitter_rng.randint(-2, 2)
-            dy = jitter_rng.randint(-2, 2)
+            zoom = 1.0 + 0.06 * zoom_scale * t
+            if jitter_scale > 0:
+                jitter_rng = random.Random((i // 6) * 7919)
+                dx = jitter_rng.randint(-2, 2) * jitter_scale
+                dy = jitter_rng.randint(-2, 2) * jitter_scale
+            else:
+                dx, dy = 0, 0
         elif "growth" in tone_key:
             zoom = 1.0
             dx = int((-6 + 12 * t) * drift_scale)
             dy = 0
         elif "breakthrough" in tone_key:
-            zoom = 1.08 - 0.08 * t
+            zoom = 1.0 + 0.08 * zoom_scale - 0.08 * zoom_scale * t
             dx = 0
             dy = int(-10 * t * drift_scale)
         elif "numbness" in tone_key:
-            zoom = 1.0 - 0.06 * t
+            zoom = 1.0 - 0.06 * zoom_scale * t
             dx, dy = 0, int(4 * t * drift_scale)
         else:  # neutral
-            zoom = 1.0 + 0.05 * t
+            zoom = 1.0 + 0.05 * zoom_scale * t
             dx = int(8 * t * drift_scale)
             dy = int(4 * t * drift_scale)
 
@@ -998,6 +1016,370 @@ def assemble_kburns_phase3(scenes: list[dict], image_paths: list[Path], audio_pa
         )
     console.print(f"  [green]OK[/] {OUT_KBURNS_P3}")
     return OUT_KBURNS_P3
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 — style validation
+# ---------------------------------------------------------------------------
+
+def validate_image(img_bytes: bytes, scene_idx: int = 0) -> tuple[bool, str]:
+    """Run 5 checks. Logs all results to rejections.log. Returns (ok, first_fail_reason|'ok')."""
+    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    arr = np.array(img, dtype=np.float32)
+    H, W = arr.shape[:2]
+    total = H * W
+    checks: dict[str, str] = {}
+    first_fail: str | None = None
+
+    # Check 1 — overall brightness
+    mean_b = float(arr.mean())
+    bright_ok = mean_b >= 110
+    checks["BRIGHT"] = f"{mean_b:.0f} {'PASS' if bright_ok else 'FAIL'}"
+    if not bright_ok:
+        first_fail = first_fail or f"too_dark (mean={mean_b:.1f})"
+
+    # Check 2 — corner background (paper tone)
+    cs = 5
+    corners = np.concatenate([
+        arr[:cs, :cs].reshape(-1, 3),
+        arr[:cs, W - cs:].reshape(-1, 3),
+        arr[H - cs:, :cs].reshape(-1, 3),
+        arr[H - cs:, W - cs:].reshape(-1, 3),
+    ])
+    avg = corners.mean(axis=0)
+    corner_ok = avg[0] >= 180 and avg[1] >= 160 and avg[2] >= 140
+    checks["CORNER"] = f"[{avg[0]:.0f},{avg[1]:.0f},{avg[2]:.0f}] {'PASS' if corner_ok else 'FAIL'}"
+    if not corner_ok:
+        first_fail = first_fail or f"dark_background (corner_avg=[{avg[0]:.0f},{avg[1]:.0f},{avg[2]:.0f}])"
+
+    # Check 3 — green/cyan detection (hue 60-180, sat > 60, val > 100)
+    r, g, b = arr[:, :, 0] / 255, arr[:, :, 1] / 255, arr[:, :, 2] / 255
+    maxc  = np.maximum(np.maximum(r, g), b)
+    delta = maxc - np.minimum(np.minimum(r, g), b)
+    hue   = np.zeros_like(r)
+    mr = (maxc == r) & (delta > 0)
+    mg = (maxc == g) & (delta > 0)
+    mb = (maxc == b) & (delta > 0)
+    hue[mr] = (60 * ((g[mr] - b[mr]) / delta[mr])) % 360
+    hue[mg] = 60 * ((b[mg] - r[mg]) / delta[mg]) + 120
+    hue[mb] = 60 * ((r[mb] - g[mb]) / delta[mb]) + 240
+    sat255 = np.where(maxc > 0, delta / maxc, 0.0) * 255
+    val255 = maxc * 255
+    green_pct = float(((hue >= 60) & (hue <= 180) & (sat255 > 60) & (val255 > 100)).sum()) / total * 100
+    green_ok  = green_pct <= 1.5
+    checks["GREEN"] = f"{green_pct:.1f}% {'PASS' if green_ok else 'FAIL'}"
+    if not green_ok:
+        first_fail = first_fail or "off-brand green/cyan color detected"
+
+    # Check 4 — dark patch (4×4 grid, any patch mean < 80 → 3D object)
+    ph, pw = H // 4, W // 4
+    gray   = arr.mean(axis=2)
+    patch_min = min(
+        float(gray[r * ph:(r + 1) * ph, c * pw:(c + 1) * pw].mean())
+        for r in range(4) for c in range(4)
+    )
+    patch_ok = patch_min >= 80
+    checks["DARK_PATCH"] = f"{patch_min:.0f} {'PASS' if patch_ok else 'FAIL'}"
+    if not patch_ok:
+        first_fail = first_fail or "3D dark object detected — not hand-drawn style"
+
+    # Check 5 — edge density (FIND_EDGES, white pixels > 18% → too detailed)
+    edges    = img.convert("L").filter(ImageFilter.FIND_EDGES)
+    edge_pct = float((np.array(edges, dtype=np.float32) > 128).sum()) / total * 100
+    edge_ok  = edge_pct <= 18.0
+    checks["EDGES"] = f"{edge_pct:.1f}% {'PASS' if edge_ok else 'FAIL'}"
+    if not edge_ok:
+        first_fail = first_fail or "too much detail — not clean hand-drawn style"
+
+    # Log every check (pass and fail) to rejections.log
+    detail   = " | ".join(f"{k}: {v}" for k, v in checks.items())
+    log_line = f"[scene_{scene_idx:03d}] {detail}\n"
+    REJECTIONS_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with REJECTIONS_LOG.open("a", encoding="utf-8") as fh:
+        fh.write(log_line)
+    console.print(f"  [dim]validation: {detail}[/]")
+
+    return first_fail is None, first_fail or "ok"
+
+
+def log_rejection(scene_idx: int, attempt: int, reason: str, kept: bool) -> None:
+    REJECTIONS_LOG.parent.mkdir(parents=True, exist_ok=True)
+    status = "KEPT_DESPITE_FAILURE" if kept else f"attempt_{attempt}"
+    with REJECTIONS_LOG.open("a", encoding="utf-8") as f:
+        f.write(f"scene_{scene_idx:03d} | {status} | {reason}\n")
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 — prompt + image cache
+# ---------------------------------------------------------------------------
+
+def _cache_key(combined_text: str, tone: str) -> str:
+    return hashlib.sha256(f"{combined_text}{tone}".encode()).hexdigest()[:16]
+
+
+def _load_cache(no_cache: bool) -> dict:
+    if no_cache:
+        return {}
+    CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if CACHE_FILE.exists():
+        try:
+            return json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_cache(cache: dict) -> None:
+    CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CACHE_FILE.write_text(json.dumps(cache, indent=2), encoding="utf-8")
+
+
+def write_prompt_cached(scene: dict, deepseek_key: str,
+                        cache: dict, no_cache: bool) -> tuple[str, str]:
+    """Return (prompt, 'HIT'|'MISS'). Updates cache in-place."""
+    key = _cache_key(scene.get("combined_text", ""), scene.get("emotional_tone", "neutral"))
+    if not no_cache and key in cache and cache[key].get("prompt"):
+        return cache[key]["prompt"], "HIT"
+    prompt = write_prompt(scene, deepseek_key)
+    cache.setdefault(key, {})["prompt"] = prompt
+    return prompt, "MISS"
+
+
+def generate_image_cached(
+    prompt: str, scene: dict, img_path: Path,
+    img_key: str, img_provider: str, img_fallback: str,
+    cache: dict, no_cache: bool,
+) -> tuple:
+    """Return (png_bytes | None, 'HIT'|'MISS'). None means cached file already copied."""
+    key = _cache_key(scene.get("combined_text", ""), scene.get("emotional_tone", "neutral"))
+    cached_path_str = cache.get(key, {}).get("image_path", "")
+    if not no_cache and cached_path_str:
+        cached_path = Path(cached_path_str)
+        if cached_path.exists():
+            if cached_path != img_path:
+                shutil.copy2(cached_path, img_path)
+            return None, "HIT"
+    png_bytes = generate_image(prompt, img_key, provider=img_provider,
+                               fallback_key=img_fallback or "")
+    cache.setdefault(key, {})["image_path"] = str(img_path)
+    return png_bytes, "MISS"
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 — thumbnail generation
+# ---------------------------------------------------------------------------
+
+def generate_thumbnail(
+    scenes: list[dict], image_paths: list[Path],
+    deepseek_key: str, img_key: str, img_provider: str, img_fallback: str,
+) -> None:
+    total_scenes = len(scenes)
+    best_idx, best_score = 0, -1.0
+    for i, scene in enumerate(scenes):
+        tone  = scene.get("emotional_tone", "neutral").lower()
+        score = intensity_score(scene["scene_index"], total_scenes)
+        if "breakthrough" in tone:
+            score += 1.0
+        if score > best_score:
+            best_score, best_idx = score, i
+
+    scene = scenes[best_idx]
+    tone  = scene.get("emotional_tone", "neutral")
+    console.print(f"\n[bold]Thumbnail:[/] scene {scene['scene_index']} ({tone}) ...")
+
+    base_prompt   = write_prompt(scene, deepseek_key)
+    boosted_prompt = (
+        base_prompt.rstrip()
+        + ", high contrast, bold lines, strong silhouette, "
+          "crack prominently visible, maximum negative space"
+    )
+    png_bytes = generate_image(boosted_prompt, img_key, provider=img_provider,
+                               fallback_key=img_fallback or "")
+
+    img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+    arr = np.array(img, dtype=np.float32)
+    H, W = arr.shape[:2]
+
+    arr = np.clip(arr + np.random.default_rng().normal(0, 14, arr.shape), 0, 255)
+
+    cx, cy   = W / 2.0, H / 2.0
+    Y_i, X_i = np.mgrid[0:H, 0:W]
+    dist     = np.sqrt(((X_i - cx) / cx) ** 2 + ((Y_i - cy) / cy) ** 2)
+    arr      = np.clip(arr * (1.0 - 0.55 * np.minimum(dist, 1.0))[:, :, np.newaxis], 0, 255)
+
+    OUT_THUMBNAIL.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(arr.astype(np.uint8)).save(str(OUT_THUMBNAIL))
+    console.print(
+        f"  [green]Thumbnail saved → {OUT_THUMBNAIL}[/] "
+        f"(scene {scene['scene_index']}, tone: {tone})"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 — subtitle word extraction and rendering
+# ---------------------------------------------------------------------------
+
+_STOP_WORDS = {
+    "the", "and", "that", "this", "with", "have", "from", "they", "will",
+    "would", "could", "should", "there", "their", "about", "which", "what",
+    "when", "then", "than", "were", "been", "being", "into", "through",
+    "because", "before", "after", "during", "between", "yourself", "himself",
+    "herself", "ourselves", "themselves",
+}
+
+
+def extract_subtitle_words(scene: dict, segments: list[dict]) -> list[str]:
+    """Return up to 3 long non-stop words from the scene's transcript window."""
+    s_start, s_end = float(scene["start"]), float(scene["end"])
+    seen: dict[str, None] = {}
+    for seg in segments:
+        if float(seg["end"]) > s_start and float(seg["start"]) < s_end:
+            for w in seg["text"].split():
+                clean = w.strip(".,!?;:\"'()[]—").lower()
+                if len(clean) > 6 and clean not in _STOP_WORDS and clean not in seen:
+                    seen[clean] = None
+                if len(seen) == 3:
+                    return list(seen)
+    return list(seen)
+
+
+def render_subtitles(frames: list, words: list[str], fade_frames: int = 12) -> list:
+    """Burn subtitle caption onto frames with fade-in. Returns new list of PIL Images."""
+    if not words or not frames:
+        return frames
+    caption = "  ".join(w.upper() for w in words)
+    try:
+        font = ImageFont.load_default(size=28)
+    except TypeError:
+        font = ImageFont.load_default()
+
+    result = []
+    for i, frame in enumerate(frames):
+        alpha_f = min(1.0, (i + 1) / max(fade_frames, 1))
+        img = frame if isinstance(frame, Image.Image) else Image.fromarray(frame)
+        img = img.copy()
+        W, H = img.size
+        overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        draw    = ImageDraw.Draw(overlay)
+        try:
+            bbox = font.getbbox(caption)
+            text_w = bbox[2] - bbox[0]
+        except AttributeError:
+            text_w = len(caption) * 7
+        x = (W - text_w) // 2
+        y = H - 52
+        opacity = int(255 * 0.70 * alpha_f)
+        draw.text((x, y), caption, font=font, fill=(44, 44, 42, opacity))
+        result.append(Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB"))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 — video assembly
+# ---------------------------------------------------------------------------
+
+def assemble_kburns_phase4(
+    scenes: list[dict],
+    image_paths: list[Path],
+    audio_path: Path,
+    segments: list[dict],
+    motion: str = "normal",
+    subtitles: bool = False,
+) -> Path:
+    from moviepy.editor import VideoClip, AudioFileClip
+
+    console.print(f"\n[bold]Assembling Ken Burns Phase 4 video (motion={motion})...[/]")
+
+    all_pil_frames: list = []
+    prev_last_frame      = None
+    prev_tone            = ""
+    total_scenes         = len(scenes)
+    summary_rows: list[tuple] = []
+
+    for scene, img_path in zip(scenes, image_paths):
+        scene_idx   = scene["scene_index"]
+        tone        = scene.get("emotional_tone", "neutral").lower().strip()
+        duration    = float(scene["end"]) - float(scene["start"])
+        show_shadow = scene.get("show_shadow", False)
+        intensity   = intensity_score(scene_idx, total_scenes)
+
+        img_pil = Image.open(str(img_path)).convert("RGB")
+        if show_shadow:
+            img_pil = apply_shadow_self(img_pil)
+        img_pil = apply_overlays(img_pil, tone, intensity, motion=motion)
+
+        # Transition
+        transition_used = "none"
+        if prev_last_frame is not None:
+            use_crack = "anxiety" in prev_tone and motion != "low"
+            transition_frames = (
+                crack_spread_p3(prev_last_frame, img_pil)
+                if use_crack
+                else shadow_fade_p3(prev_last_frame, img_pil)
+            )
+            all_pil_frames.extend(transition_frames)
+            transition_used = "crack_spread" if use_crack else "shadow_fade"
+
+        kb_frames = apply_ken_burns(img_pil, tone, duration, fps=FPS,
+                                    intensity=intensity, motion=motion)
+
+        # Subtitles
+        subtitle_words: list[str] = []
+        if subtitles:
+            subtitle_words = extract_subtitle_words(scene, segments)
+            if subtitle_words:
+                kb_frames = render_subtitles(kb_frames, subtitle_words)
+
+        all_pil_frames.extend(kb_frames)
+        prev_last_frame = kb_frames[-1] if kb_frames else img_pil
+        prev_tone = tone
+
+        overlay_desc = (
+            "crack_glow+grain+vignette"
+            if (motion == "cinematic" or "breakthrough" in tone or "trauma" in tone)
+            else "grain+vignette"
+        )
+        if show_shadow:
+            overlay_desc += "+shadow_self"
+        summary_rows.append((
+            scene_idx, tone, round(intensity, 2),
+            transition_used, overlay_desc,
+            ", ".join(subtitle_words) if subtitle_words else "—",
+        ))
+
+    if not all_pil_frames:
+        console.print("[red]ERROR:[/] No frames generated.")
+        return OUT_KBURNS_P4
+
+    total     = len(all_pil_frames)
+    np_frames = [np.array(f) for f in all_pil_frames]
+
+    def make_frame(t: float) -> np.ndarray:
+        return np_frames[min(int(t * FPS), total - 1)]
+
+    video     = VideoClip(make_frame, duration=total / FPS).set_fps(FPS)
+    audio     = AudioFileClip(str(audio_path))
+    final_dur = min(video.duration, audio.duration)
+    final     = video.subclip(0, final_dur).set_audio(audio.subclip(0, final_dur))
+
+    console.print(f"  Writing [cyan]{OUT_KBURNS_P4.name}[/] ...")
+    final.write_videofile(
+        str(OUT_KBURNS_P4), fps=FPS, codec="libx264", audio_codec="aac",
+        temp_audiofile=str(OUTPUT_DIR / "_tmp_p4_audio.m4a"),
+        remove_temp=True, logger=None,
+    )
+    final.close(); audio.close(); video.close()
+
+    console.print(f"\n[bold green]Phase 4 Summary (motion={motion}):[/]")
+    console.print(f"  Scenes       : {len(scenes)}")
+    console.print(f"  Total frames : {total}")
+    for row in summary_rows:
+        console.print(
+            f"  scene_{row[0]:03d}  tone={row[1]}  intensity={row[2]:.2f}  "
+            f"transition={row[3]}  overlay={row[4]}  subtitles=[{row[5]}]"
+        )
+    console.print(f"  [green]OK[/] {OUT_KBURNS_P4}")
+    return OUT_KBURNS_P4
 
 
 # ---------------------------------------------------------------------------
@@ -1182,18 +1564,26 @@ def chunk_by_interval(segments: list[dict], interval: float, max_seconds: float)
 def main():
     load_env()
 
-    parser = argparse.ArgumentParser(description="Phase 1 test: identity-locked character, 20s clip")
-    parser.add_argument("--source",  default=None,   help="Source MP4 path")
-    parser.add_argument("--seconds", type=float, default=20.0, help="Test clip length in seconds")
-    parser.add_argument("--style",   default="both", choices=["kburns", "aivid", "both"],
+    parser = argparse.ArgumentParser(description="Phase 1-4 test: identity-locked character")
+    parser.add_argument("--source",    default=None,   help="Source MP4 path")
+    parser.add_argument("--seconds",   type=float, default=20.0, help="Test clip length in seconds")
+    parser.add_argument("--style",     default="both", choices=["kburns", "aivid", "both"],
                         help="Animation style: kburns | aivid | both")
-    parser.add_argument("--dry-run",  action="store_true", help="Preview scene plan, no images generated")
-    parser.add_argument("--interval", type=float, default=None,
+    parser.add_argument("--dry-run",   action="store_true", help="Preview scene plan, no images generated")
+    parser.add_argument("--interval",  type=float, default=None,
                         help="Fixed image interval in seconds (e.g. 4). Default: use DeepSeek scene grouping.")
-    parser.add_argument("--provider", default="auto", choices=["auto", "gemini", "openrouter"],
+    parser.add_argument("--provider",  default="auto", choices=["auto", "gemini", "openrouter"],
                         help="Image provider: gemini (free direct), openrouter (~$0.02/image), auto (default)")
     parser.add_argument("--regenerate", action="store_true",
                         help="Delete cached scene images before generating — forces fresh prompts and images")
+    parser.add_argument("--thumbnail", action="store_true",
+                        help="Generate thumbnail only (skips video assembly)")
+    parser.add_argument("--subtitles", action="store_true",
+                        help="Burn psychological keyword captions onto Ken Burns Phase 4 video")
+    parser.add_argument("--motion",    default="normal", choices=["low", "normal", "cinematic"],
+                        help="Ken Burns motion intensity: low | normal | cinematic")
+    parser.add_argument("--no-cache",  action="store_true", dest="no_cache",
+                        help="Bypass prompt and image cache")
     args = parser.parse_args()
 
     source_mp4 = Path(args.source) if args.source else find_source_mp4()
@@ -1276,9 +1666,14 @@ def main():
         if stale:
             console.print(f"  [yellow]--regenerate:[/] deleted {len(stale)} cached image(s)")
 
-    # Reset prompt audit log for this run
+    # Reset logs for this run
     if PROMPTS_LOG.exists():
         PROMPTS_LOG.unlink()
+    if REJECTIONS_LOG.exists():
+        REJECTIONS_LOG.unlink()
+
+    # Load prompt/image cache
+    cache = _load_cache(args.no_cache)
 
     # Generate images
     src = "Gemini API (free)" if img_provider == "gemini_direct" else "Gemini via OpenRouter"
@@ -1290,21 +1685,58 @@ def main():
         tone     = scene.get("emotional_tone", "neutral")
         img_path = IMAGES_DIR / f"scene_{idx:03d}.png"
 
-        if img_path.exists():
+        if img_path.exists() and not args.regenerate:
             console.print(f"  skip scene {idx} (image exists)")
             image_paths.append(img_path)
             continue
 
         try:
-            prompt    = write_prompt(scene, deepseek_key)
+            # Prompt (cache-aware)
+            prompt, p_status = write_prompt_cached(scene, deepseek_key, cache, args.no_cache)
+            console.print(f"  [dim][CACHE {p_status}][/] prompt scene {idx}")
             log_prompt_used(idx, tone, prompt)
             time.sleep(0.2)
-            png_bytes = generate_image(prompt, img_key, provider=img_provider, fallback_key=img_fallback or "")
-            png_bytes = apply_paper_grain(png_bytes)
+
+            # Image generation + validation with up to 2 retries
+            png_bytes = None
+            img_cache_status = "MISS"
+            for attempt in range(3):
+                if attempt == 0:
+                    raw_bytes, img_cache_status = generate_image_cached(
+                        prompt, scene, img_path,
+                        img_key, img_provider, img_fallback or "",
+                        cache, args.no_cache,
+                    )
+                    if raw_bytes is None:
+                        # cache hit — file already on disk
+                        console.print(f"  [dim][CACHE HIT][/] image scene {idx}")
+                        png_bytes = img_path.read_bytes()
+                        break
+                    png_bytes = apply_paper_grain(raw_bytes)
+                else:
+                    raw_bytes = generate_image(
+                        prompt, img_key, provider=img_provider,
+                        fallback_key=img_fallback or "",
+                    )
+                    png_bytes = apply_paper_grain(raw_bytes)
+
+                ok, reason = validate_image(png_bytes, idx)
+                if ok:
+                    break
+                # Validation failed
+                kept = attempt == 2
+                log_rejection(idx, attempt + 1, reason, kept)
+                if kept:
+                    console.print(f"  [yellow]WARN[/] scene {idx}: validation failed twice — keeping image")
+                else:
+                    console.print(f"  [red][REJECTED scene_{idx} attempt {attempt + 1}: {reason}][/] → regenerating")
+                    time.sleep(1)
+
             img_path.write_bytes(png_bytes)
+            _save_cache(cache)
             console.print(
                 f"  [green]OK[/] scene {idx} [{seconds_to_mmss(scene['start'])}] "
-                f"[bold]{scene['concept']}[/] [dim]({tone})[/]"
+                f"[bold]{scene['concept']}[/] [dim]({tone}) [CACHE {img_cache_status}][/]"
             )
             image_paths.append(img_path)
         except Exception as e:
@@ -1331,10 +1763,25 @@ def main():
     console.print(f"\n[bold]Step 3:[/] Extracting audio...")
     audio_path = extract_audio(source_mp4)
 
+    # Thumbnail mode — skip video assembly
+    if args.thumbnail:
+        generate_thumbnail(
+            assembled_scenes, image_paths,
+            deepseek_key, img_key, img_provider, img_fallback or "",
+        )
+        console.print("\n[bold green]Done (thumbnail mode).[/]")
+        return
+
     # Ken Burns
     if args.style in ("kburns", "both"):
         assemble_kburns_phase2(assembled_scenes, image_paths, audio_path)
         assemble_kburns_phase3(assembled_scenes, image_paths, audio_path)
+        assemble_kburns_phase4(
+            assembled_scenes, image_paths, audio_path,
+            segments=segments,
+            motion=args.motion,
+            subtitles=args.subtitles,
+        )
 
     # AI Video
     if args.style in ("aivid", "both"):
@@ -1360,6 +1807,7 @@ def main():
     if args.style in ("kburns", "both"):
         console.print(f"  Ken Burns P2 -> [cyan]{OUT_KBURNS_P2}[/]")
         console.print(f"  Ken Burns P3 -> [cyan]{OUT_KBURNS_P3}[/]")
+        console.print(f"  Ken Burns P4 -> [cyan]{OUT_KBURNS_P4}[/] (motion={args.motion})")
     if args.style in ("aivid", "both"):
         console.print(f"  AI Video  -> [cyan]{OUT_AIVID}[/]")
     console.print(f"  Scenes    : {len(assembled_scenes)}")
