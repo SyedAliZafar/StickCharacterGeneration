@@ -1,71 +1,83 @@
-# Run
+# How to Run
 
-## .env keys
+## Files needed before you start
+
 ```
-DEEPSEEK_API_KEY=...         # required
-GEMINI_API_KEY=AIza...       # free, ~1500/day (preferred)
-OPENROUTER_API_KEY=sk-or-... # fallback, ~$0.02/image
-OPENAI_API_KEY=sk-proj-...   # generate.py only
-RUNWAYML_API_KEY=...         # --style aivid only
+video/
+├── your_video.mp4        ← source video
+└── your_video.txt        ← transcript (same filename stem as MP4)
+
+.env                      ← API keys (DEEPSEEK_API_KEY, GEMINI_API_KEY or OPENROUTER_API_KEY)
 ```
 
 ---
 
-## test_animate.py — test run (3 random scenes)
+## Step 1 — Generate images + save scenes
 
 ```bash
-uv run test_animate.py --dry-run                          # preview, zero cost
-uv run test_animate.py --style kburns                     # Ken Burns (P2+P3+P4)
-uv run test_animate.py --style kburns --motion cinematic  # cinematic motion
-uv run test_animate.py --style kburns --subtitles         # burn keyword captions
-uv run test_animate.py --thumbnail                        # thumbnail only
-uv run test_animate.py --style kburns --no-cache          # force fresh generation
-uv run test_animate.py --style kburns --regenerate        # delete + redo images
-uv run test_animate.py --interval 4 --seconds 50          # fixed 4s intervals
+uv run test_animate.py --full-run
 ```
 
-Output → `output/phase1_test/` (kburns_phase2/3/4.mp4)
+- Calls DeepSeek to group transcript into scenes
+- Generates one image per scene via Gemini (free) or OpenRouter (~$0.02/image)
+- Saves frames to `output/full_run/frames/`
+- Saves `output/full_run/scenes.json` (used by Step 2)
+- **If frames already exist, they are skipped — no extra cost**
 
 ---
 
-## test_animate.py — full production run (all scenes)
+## Step 2 — Assemble video
 
 ```bash
-uv run test_animate.py --full-run --dry-run --provider openrouter   # preview
-uv run test_animate.py --full-run --style kburns --motion cinematic --provider openrouter
+uv run assemble_video.py
 ```
 
-Output → `output/full_run/final.mp4` · Restarts safe (validated frames reused)
+- Reads frames from `output/full_run/frames/`
+- Reads tone data from `output/full_run/scenes.json`
+- Auto-detects audio from `video/*.mp4`
+- Outputs `output/full_run/final_still.mp4`
 
----
-
-## animate.py — code-rendered (zero cost)
+### Options
 
 ```bash
-uv run animate.py --dry-run
-uv run animate.py
+uv run assemble_video.py --subtitles              # burn keyword captions onto frames
+uv run assemble_video.py --motion smooth          # add gentle zoom/pan
+uv run assemble_video.py --motion cinematic       # dramatic zoom
+uv run assemble_video.py --out output/my.mp4      # custom output path
+uv run assemble_video.py --thumbnail              # generate thumbnail only
 ```
-
-Output → `output/animation.mp4`
 
 ---
 
-## generate.py — production images (gpt-image-1)
+## Step 3 — Generate captions for CapCut
 
 ```bash
-uv run generate.py --dry-run --transcript video/my.txt
-uv run generate.py --transcript video/my.txt
+uv run caption.py
 ```
 
-Output → `output/frames/` · `output/results.json`
+- Auto-detects `video/*.txt` transcript
+- Outputs `video/your_video.srt` next to the transcript
+- **In CapCut:** Captions → Import → select the `.srt` file
+
+### Options
+
+```bash
+uv run caption.py --merge 1.5    # merge captions shorter than 1.5s (stops fast flashing)
+uv run caption.py --out output/caps.srt   # custom output path
+```
 
 ---
 
-## Tone duration caps
+## Output
 
-| Tone | Cap |
-|---|---|
-| anxiety/stress | 3s |
-| breakthrough / neutral | 5s |
-| growth/healing | 6s |
-| heavy trauma / numbness | 8s |
+```
+video/
+└── your_video.srt        ← import into CapCut
+
+output/
+├── full_run/
+│   ├── frames/           ← scene_001.png … scene_086.png
+│   ├── scenes.json       ← scene metadata (tone, timing)
+│   └── final_still.mp4  ← your video
+└── thumbnail.png         ← if --thumbnail was used
+```

@@ -1572,7 +1572,7 @@ def main():
     parser = argparse.ArgumentParser(description="Phase 1-4 test: identity-locked character")
     parser.add_argument("--source",    default=None,   help="Source MP4 path")
     parser.add_argument("--seconds",   type=float, default=20.0, help="Test clip length in seconds")
-    parser.add_argument("--style",     default="both", choices=["kburns", "aivid", "both"],
+    parser.add_argument("--style",     default="kburns", choices=["kburns", "aivid", "both"],
                         help="Animation style: kburns | aivid | both")
     parser.add_argument("--dry-run",   action="store_true", help="Preview scene plan, no images generated")
     parser.add_argument("--interval",  type=float, default=None,
@@ -1820,6 +1820,11 @@ def main():
     # Align scene list to only scenes that produced an image
     generated_idxs = {int(p.stem.split("_")[1]) for p in image_paths}
     assembled_scenes = [s for s in test_scenes if s["scene_index"] in generated_idxs]
+
+    # Save scene metadata for standalone assembler
+    scenes_json_path = OUTPUT_DIR / "scenes.json"
+    scenes_json_path.write_text(json.dumps(assembled_scenes, indent=2), encoding="utf-8")
+    console.print(f"  [dim]Scenes saved → {scenes_json_path}[/]")
 
     # Extract audio
     console.print(f"\n[bold]Step 3:[/] Extracting audio...")
