@@ -1113,8 +1113,8 @@ def log_rejection(scene_idx: int, attempt: int, reason: str, kept: bool) -> None
 # Phase 4 — prompt + image cache
 # ---------------------------------------------------------------------------
 
-def _cache_key(combined_text: str, tone: str) -> str:
-    return hashlib.sha256(f"{combined_text}{tone}".encode()).hexdigest()[:16]
+def _cache_key(combined_text: str, tone: str, concept: str = "") -> str:
+    return hashlib.sha256(f"{combined_text}{tone}{concept}".encode()).hexdigest()[:16]
 
 
 def _load_cache(no_cache: bool) -> dict:
@@ -1137,7 +1137,7 @@ def _save_cache(cache: dict) -> None:
 def write_prompt_cached(scene: dict, deepseek_key: str,
                         cache: dict, no_cache: bool) -> tuple[str, str]:
     """Return (prompt, 'HIT'|'MISS'). Updates cache in-place."""
-    key = _cache_key(scene.get("combined_text", ""), scene.get("emotional_tone", "neutral"))
+    key = _cache_key(scene.get("combined_text", ""), scene.get("emotional_tone", "neutral"), scene.get("concept", ""))
     if not no_cache and key in cache and cache[key].get("prompt"):
         return cache[key]["prompt"], "HIT"
     prompt = write_prompt(scene, deepseek_key)
@@ -1151,7 +1151,7 @@ def generate_image_cached(
     cache: dict, no_cache: bool,
 ) -> tuple:
     """Return (png_bytes | None, 'HIT'|'MISS'). None means cached file already copied."""
-    key = _cache_key(scene.get("combined_text", ""), scene.get("emotional_tone", "neutral"))
+    key = _cache_key(scene.get("combined_text", ""), scene.get("emotional_tone", "neutral"), scene.get("concept", ""))
     cached_path_str = cache.get(key, {}).get("image_path", "")
     if not no_cache and cached_path_str:
         cached_path = Path(cached_path_str)
@@ -1286,93 +1286,98 @@ def assemble_kburns_phase4(
     motion: str = "normal",
     subtitles: bool = False,
 ) -> Path:
-    from moviepy.editor import VideoClip, AudioFileClip
-
     console.print(f"\n[bold]Assembling Ken Burns Phase 4 video (motion={motion})...[/]")
 
-    all_pil_frames: list = []
+    with Image.open(str(image_paths[0])) as _probe:
+        W, H = _probe.size
+
+    ffmpeg_bin = shutil.which("ffmpeg") or "ffmpeg"
+    OUT_KBURNS_P4.parent.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        ffmpeg_bin, "-y",
+        "-f", "rawvideo", "-vcodec", "rawvideo",
+        "-s", f"{W}x{H}", "-pix_fmt", "rgb24", "-r", str(FPS),
+        "-i", "pipe:0",
+        "-i", str(audio_path),
+        "-vcodec", "libx264", "-preset", "fast", "-crf", "18",
+        "-acodec", "aac", "-shortest",
+        str(OUT_KBURNS_P4),
+    ]
+
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
     prev_last_frame      = None
     prev_tone            = ""
     total_scenes         = len(scenes)
+    total_frames         = 0
     summary_rows: list[tuple] = []
 
-    for scene, img_path in zip(scenes, image_paths):
-        scene_idx   = scene["scene_index"]
-        tone        = scene.get("emotional_tone", "neutral").lower().strip()
-        duration    = float(scene["end"]) - float(scene["start"])
-        show_shadow = scene.get("show_shadow", False)
-        intensity   = intensity_score(scene_idx, total_scenes)
+    try:
+        for scene, img_path in zip(scenes, image_paths):
+            scene_idx   = scene["scene_index"]
+            tone        = scene.get("emotional_tone", "neutral").lower().strip()
+            duration    = float(scene["end"]) - float(scene["start"])
+            show_shadow = scene.get("show_shadow", False)
+            intensity   = intensity_score(scene_idx, total_scenes)
 
-        img_pil = Image.open(str(img_path)).convert("RGB")
-        if show_shadow:
-            img_pil = apply_shadow_self(img_pil)
-        img_pil = apply_overlays(img_pil, tone, intensity, motion=motion)
+            img_pil = Image.open(str(img_path)).convert("RGB")
+            if show_shadow:
+                img_pil = apply_shadow_self(img_pil)
+            img_pil = apply_overlays(img_pil, tone, intensity, motion=motion)
 
-        # Transition
-        transition_used = "none"
-        if prev_last_frame is not None:
-            use_crack = "anxiety" in prev_tone and motion != "low"
-            transition_frames = (
-                crack_spread_p3(prev_last_frame, img_pil)
-                if use_crack
-                else shadow_fade_p3(prev_last_frame, img_pil)
+            # Transition — stream frames immediately, no list accumulation
+            transition_used = "none"
+            if prev_last_frame is not None:
+                use_crack = "anxiety" in prev_tone and motion != "low"
+                transition_frames = (
+                    crack_spread_p3(prev_last_frame, img_pil)
+                    if use_crack
+                    else shadow_fade_p3(prev_last_frame, img_pil)
+                )
+                for f in transition_frames:
+                    proc.stdin.write(np.array(f, dtype=np.uint8).tobytes())
+                    total_frames += 1
+                transition_used = "crack_spread" if use_crack else "shadow_fade"
+
+            kb_frames = apply_ken_burns(img_pil, tone, duration, fps=FPS,
+                                        intensity=intensity, motion=motion)
+
+            subtitle_words: list[str] = []
+            if subtitles:
+                subtitle_words = extract_subtitle_words(scene, segments)
+                if subtitle_words:
+                    kb_frames = render_subtitles(kb_frames, subtitle_words)
+
+            for f in kb_frames:
+                proc.stdin.write(np.array(f, dtype=np.uint8).tobytes())
+                total_frames += 1
+
+            prev_last_frame = kb_frames[-1] if kb_frames else img_pil
+            prev_tone = tone
+
+            overlay_desc = (
+                "crack_glow+grain+vignette"
+                if (motion == "cinematic" or "breakthrough" in tone or "trauma" in tone)
+                else "grain+vignette"
             )
-            all_pil_frames.extend(transition_frames)
-            transition_used = "crack_spread" if use_crack else "shadow_fade"
+            if show_shadow:
+                overlay_desc += "+shadow_self"
+            summary_rows.append((
+                scene_idx, tone, round(intensity, 2),
+                transition_used, overlay_desc,
+                ", ".join(subtitle_words) if subtitle_words else "—",
+            ))
+    finally:
+        proc.stdin.close()
 
-        kb_frames = apply_ken_burns(img_pil, tone, duration, fps=FPS,
-                                    intensity=intensity, motion=motion)
-
-        # Subtitles
-        subtitle_words: list[str] = []
-        if subtitles:
-            subtitle_words = extract_subtitle_words(scene, segments)
-            if subtitle_words:
-                kb_frames = render_subtitles(kb_frames, subtitle_words)
-
-        all_pil_frames.extend(kb_frames)
-        prev_last_frame = kb_frames[-1] if kb_frames else img_pil
-        prev_tone = tone
-
-        overlay_desc = (
-            "crack_glow+grain+vignette"
-            if (motion == "cinematic" or "breakthrough" in tone or "trauma" in tone)
-            else "grain+vignette"
-        )
-        if show_shadow:
-            overlay_desc += "+shadow_self"
-        summary_rows.append((
-            scene_idx, tone, round(intensity, 2),
-            transition_used, overlay_desc,
-            ", ".join(subtitle_words) if subtitle_words else "—",
-        ))
-
-    if not all_pil_frames:
-        console.print("[red]ERROR:[/] No frames generated.")
-        return OUT_KBURNS_P4
-
-    total     = len(all_pil_frames)
-    np_frames = [np.array(f) for f in all_pil_frames]
-
-    def make_frame(t: float) -> np.ndarray:
-        return np_frames[min(int(t * FPS), total - 1)]
-
-    video     = VideoClip(make_frame, duration=total / FPS).set_fps(FPS)
-    audio     = AudioFileClip(str(audio_path))
-    final_dur = min(video.duration, audio.duration)
-    final     = video.subclip(0, final_dur).set_audio(audio.subclip(0, final_dur))
-
-    console.print(f"  Writing [cyan]{OUT_KBURNS_P4.name}[/] ...")
-    final.write_videofile(
-        str(OUT_KBURNS_P4), fps=FPS, codec="libx264", audio_codec="aac",
-        temp_audiofile=str(OUTPUT_DIR / "_tmp_p4_audio.m4a"),
-        remove_temp=True, logger=None,
-    )
-    final.close(); audio.close(); video.close()
+    proc.wait()
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg exited with code {proc.returncode}")
 
     console.print(f"\n[bold green]Phase 4 Summary (motion={motion}):[/]")
     console.print(f"  Scenes       : {len(scenes)}")
-    console.print(f"  Total frames : {total}")
+    console.print(f"  Total frames : {total_frames}")
     for row in summary_rows:
         console.print(
             f"  scene_{row[0]:03d}  tone={row[1]}  intensity={row[2]:.2f}  "
@@ -1584,7 +1589,18 @@ def main():
                         help="Ken Burns motion intensity: low | normal | cinematic")
     parser.add_argument("--no-cache",  action="store_true", dest="no_cache",
                         help="Bypass prompt and image cache")
+    parser.add_argument("--full-run",  action="store_true", dest="full_run",
+                        help="Process ALL transcript scenes; output to output/full_run/final.mp4")
     args = parser.parse_args()
+
+    if args.full_run:
+        global OUTPUT_DIR, IMAGES_DIR, CLIPS_DIR, PROMPTS_LOG, OUT_KBURNS_P4, REJECTIONS_LOG
+        OUTPUT_DIR     = ROOT / "output" / "full_run"
+        IMAGES_DIR     = OUTPUT_DIR / "frames"
+        CLIPS_DIR      = OUTPUT_DIR / "aivid_clips"
+        PROMPTS_LOG    = OUTPUT_DIR / "prompts_used.txt"
+        OUT_KBURNS_P4  = OUTPUT_DIR / "final.mp4"
+        REJECTIONS_LOG = OUTPUT_DIR / "rejections.log"
 
     source_mp4 = Path(args.source) if args.source else find_source_mp4()
     if not source_mp4.exists():
@@ -1635,14 +1651,26 @@ def main():
     else:
         all_scenes  = group_segments(segments, deepseek_key)
         all_scenes  = split_long_scenes(all_scenes)
-        sample      = random.sample(all_scenes, min(3, len(all_scenes)))
-        test_scenes = sorted(sample, key=lambda s: s["scene_index"])
-        idxs        = ", ".join(str(s["scene_index"]) for s in test_scenes)
-        console.print(f"  [green]Selected scenes:[/] {idxs} (random sample)")
+        if args.full_run:
+            test_scenes = all_scenes
+            console.print(f"  [green]All {len(test_scenes)} scenes selected (full run)[/]")
+        else:
+            sample      = random.sample(all_scenes, min(3, len(all_scenes)))
+            test_scenes = sorted(sample, key=lambda s: s["scene_index"])
+            idxs        = ", ".join(str(s["scene_index"]) for s in test_scenes)
+            console.print(f"  [green]Selected scenes:[/] {idxs} (random sample)")
 
     if not test_scenes:
         console.print("[red]ERROR:[/] No scenes generated for the requested duration.")
         sys.exit(1)
+
+    if args.full_run:
+        total_est_dur = sum(float(s["end"]) - float(s["start"]) for s in test_scenes)
+        est_cost      = len(test_scenes) * 0.02
+        console.print(f"\n[bold]Full Run Preview:[/]")
+        console.print(f"  Total scenes      : {len(test_scenes)}")
+        console.print(f"  Estimated cost    : ~${est_cost:.2f} ({len(test_scenes)} × $0.02/image)")
+        console.print(f"  Estimated duration: ~{seconds_to_mmss(total_est_dur)}")
 
     if args.dry_run:
         dry_run_scenes(test_scenes, img_provider or "openrouter")
@@ -1678,7 +1706,13 @@ def main():
     # Generate images
     src = "Gemini API (free)" if img_provider == "gemini_direct" else "Gemini via OpenRouter"
     console.print(f"\n[bold]Step 2:[/] Generating {len(test_scenes)} images with {src}...\n")
-    image_paths = []
+    image_paths       = []
+    cache_hits        = 0
+    prompt_cache_hits = 0
+    img_api_calls     = 0
+    total_rejections  = 0
+    total_regen       = 0
+    seen_hashes: dict = {}  # md5 -> scene_idx, for duplicate detection in full-run
 
     for scene in track(test_scenes, description="Generating images..."):
         idx      = scene["scene_index"]
@@ -1686,13 +1720,32 @@ def main():
         img_path = IMAGES_DIR / f"scene_{idx:03d}.png"
 
         if img_path.exists() and not args.regenerate:
-            console.print(f"  skip scene {idx} (image exists)")
-            image_paths.append(img_path)
-            continue
+            if args.full_run:
+                raw = img_path.read_bytes()
+                ok, _ = validate_image(raw, idx)
+                if ok:
+                    img_md5 = hashlib.md5(raw).hexdigest()
+                    if img_md5 in seen_hashes:
+                        console.print(f"  [yellow]Duplicate of scene {seen_hashes[img_md5]} — regenerating scene {idx}[/]")
+                        img_path.unlink()
+                    else:
+                        seen_hashes[img_md5] = idx
+                        console.print(f"  skip scene {idx} (exists, validation PASS)")
+                        image_paths.append(img_path)
+                        cache_hits += 1
+                        continue
+                else:
+                    console.print(f"  [yellow]Existing image failed validation — regenerating scene {idx}[/]")
+            else:
+                console.print(f"  skip scene {idx} (image exists)")
+                image_paths.append(img_path)
+                continue
 
         try:
             # Prompt (cache-aware)
             prompt, p_status = write_prompt_cached(scene, deepseek_key, cache, args.no_cache)
+            if p_status == "HIT":
+                prompt_cache_hits += 1
             console.print(f"  [dim][CACHE {p_status}][/] prompt scene {idx}")
             log_prompt_used(idx, tone, prompt)
             time.sleep(0.2)
@@ -1711,20 +1764,26 @@ def main():
                         # cache hit — file already on disk
                         console.print(f"  [dim][CACHE HIT][/] image scene {idx}")
                         png_bytes = img_path.read_bytes()
+                        cache_hits += 1
                         break
+                    img_api_calls += 1
                     png_bytes = apply_paper_grain(raw_bytes)
                 else:
                     raw_bytes = generate_image(
                         prompt, img_key, provider=img_provider,
                         fallback_key=img_fallback or "",
                     )
+                    img_api_calls += 1
                     png_bytes = apply_paper_grain(raw_bytes)
 
                 ok, reason = validate_image(png_bytes, idx)
                 if ok:
+                    if attempt > 0:
+                        total_regen += 1
                     break
                 # Validation failed
                 kept = attempt == 2
+                total_rejections += 1
                 log_rejection(idx, attempt + 1, reason, kept)
                 if kept:
                     console.print(f"  [yellow]WARN[/] scene {idx}: validation failed twice — keeping image")
@@ -1734,9 +1793,12 @@ def main():
 
             img_path.write_bytes(png_bytes)
             _save_cache(cache)
+            s_intensity = intensity_score(idx, len(test_scenes))
             console.print(
-                f"  [green]OK[/] scene {idx} [{seconds_to_mmss(scene['start'])}] "
-                f"[bold]{scene['concept']}[/] [dim]({tone}) [CACHE {img_cache_status}][/]"
+                f"  [green]OK[/] scene {idx} "
+                f"[{seconds_to_mmss(scene['start'])}-{seconds_to_mmss(scene['end'])}] "
+                f"[bold]{scene['concept']}[/] "
+                f"[dim]tone={tone} intensity={s_intensity:.2f} [CACHE {img_cache_status}][/]"
             )
             image_paths.append(img_path)
         except Exception as e:
@@ -1774,14 +1836,29 @@ def main():
 
     # Ken Burns
     if args.style in ("kburns", "both"):
-        assemble_kburns_phase2(assembled_scenes, image_paths, audio_path)
-        assemble_kburns_phase3(assembled_scenes, image_paths, audio_path)
-        assemble_kburns_phase4(
-            assembled_scenes, image_paths, audio_path,
-            segments=segments,
-            motion=args.motion,
-            subtitles=args.subtitles,
-        )
+        if args.full_run:
+            try:
+                assemble_kburns_phase4(
+                    assembled_scenes, image_paths, audio_path,
+                    segments=segments,
+                    motion=args.motion,
+                    subtitles=args.subtitles,
+                )
+            except Exception as e:
+                console.print(f"\n[red]Assembly failed: {e}[/]")
+                console.print("[yellow]Generated images saved at:[/]")
+                for p in image_paths:
+                    console.print(f"  {p}")
+                sys.exit(1)
+        else:
+            assemble_kburns_phase2(assembled_scenes, image_paths, audio_path)
+            assemble_kburns_phase3(assembled_scenes, image_paths, audio_path)
+            assemble_kburns_phase4(
+                assembled_scenes, image_paths, audio_path,
+                segments=segments,
+                motion=args.motion,
+                subtitles=args.subtitles,
+            )
 
     # AI Video
     if args.style in ("aivid", "both"):
@@ -1804,23 +1881,39 @@ def main():
         pass
 
     console.print("\n[bold green]Done.[/]")
-    if args.style in ("kburns", "both"):
-        console.print(f"  Ken Burns P2 -> [cyan]{OUT_KBURNS_P2}[/]")
-        console.print(f"  Ken Burns P3 -> [cyan]{OUT_KBURNS_P3}[/]")
-        console.print(f"  Ken Burns P4 -> [cyan]{OUT_KBURNS_P4}[/] (motion={args.motion})")
-    if args.style in ("aivid", "both"):
-        console.print(f"  AI Video  -> [cyan]{OUT_AIVID}[/]")
-    console.print(f"  Scenes    : {len(assembled_scenes)}")
-    console.print(f"  Images    : [cyan]{IMAGES_DIR}[/]")
-    console.print(f"  Prompts   : [cyan]{PROMPTS_LOG}[/]")
-    console.print("\n[bold]Scenes produced:[/]")
-    for s in assembled_scenes:
-        console.print(
-            f"  scene_{s['scene_index']:03d}  "
-            f"[cyan]{seconds_to_mmss(s['start'])}-{seconds_to_mmss(s['end'])}[/]  "
-            f"[magenta]{s.get('emotional_tone', 'neutral')}[/]  "
-            f"{s['concept']}"
-        )
+    if args.full_run:
+        total_run_dur = sum(float(s["end"]) - float(s["start"]) for s in assembled_scenes)
+        cost_spent    = img_api_calls * 0.02
+        console.print(f"\n[bold]Full Run Summary:[/]")
+        console.print(f"  Scenes generated  : {len(assembled_scenes)}")
+        console.print(f"  From cache/skip   : {cache_hits}")
+        console.print(f"  API calls made    : {img_api_calls}")
+        console.print(f"  Prompt cache hits : {prompt_cache_hits}")
+        console.print(f"  Validation fails  : {total_rejections}")
+        console.print(f"  Successful regen  : {total_regen}")
+        console.print(f"  Video duration    : ~{seconds_to_mmss(total_run_dur)}")
+        console.print(f"  Cost spent        : ${cost_spent:.2f}")
+        console.print(f"  Final video       : [cyan]{OUT_KBURNS_P4}[/]")
+        console.print(f"  Images            : [cyan]{IMAGES_DIR}[/]")
+        console.print(f"  Rejection log     : [cyan]{REJECTIONS_LOG}[/]")
+    else:
+        if args.style in ("kburns", "both"):
+            console.print(f"  Ken Burns P2 -> [cyan]{OUT_KBURNS_P2}[/]")
+            console.print(f"  Ken Burns P3 -> [cyan]{OUT_KBURNS_P3}[/]")
+            console.print(f"  Ken Burns P4 -> [cyan]{OUT_KBURNS_P4}[/] (motion={args.motion})")
+        if args.style in ("aivid", "both"):
+            console.print(f"  AI Video  -> [cyan]{OUT_AIVID}[/]")
+        console.print(f"  Scenes    : {len(assembled_scenes)}")
+        console.print(f"  Images    : [cyan]{IMAGES_DIR}[/]")
+        console.print(f"  Prompts   : [cyan]{PROMPTS_LOG}[/]")
+        console.print("\n[bold]Scenes produced:[/]")
+        for s in assembled_scenes:
+            console.print(
+                f"  scene_{s['scene_index']:03d}  "
+                f"[cyan]{seconds_to_mmss(s['start'])}-{seconds_to_mmss(s['end'])}[/]  "
+                f"[magenta]{s.get('emotional_tone', 'neutral')}[/]  "
+                f"{s['concept']}"
+            )
 
 
 if __name__ == "__main__":
